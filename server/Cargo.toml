@@ -1,0 +1,10 @@
+[package]
+name = "vscode-ls-php-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+serde_json = "1.0"
+tokio = { version = "1.38", features = ["macros", "rt-multi-thread", "io-std"] }
+tower-lsp = "0.20"
