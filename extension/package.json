@@ -1,0 +1,100 @@
+{
+  "name": "vscode-ls-php",
+  "displayName": "VSCode LS PHP",
+  "description": "PHP language extension powered by a Rust language server.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:php",
+    "onLanguage:blade"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "vscode-ls-php.restartServer",
+        "title": "VSCode LS PHP: Restart Language Server"
+      },
+      {
+        "command": "vscode-ls-php.launchXdebugSession",
+        "title": "VSCode LS PHP: Launch Xdebug Session"
+      },
+      {
+        "command": "vscode-ls-php.writeXdebugTemplate",
+        "title": "VSCode LS PHP: Write Xdebug Template"
+      },
+      {
+        "command": "vscode-ls-php.refreshTests",
+        "title": "VSCode LS PHP: Refresh Tests"
+      },
+      {
+        "command": "vscode-ls-php.startContinuousTesting",
+        "title": "VSCode LS PHP: Start Continuous Testing"
+      },
+      {
+        "command": "vscode-ls-php.stopContinuousTesting",
+        "title": "VSCode LS PHP: Stop Continuous Testing"
+      },
+      {
+        "command": "vscode-ls-php.openProfilingDashboard",
+        "title": "VSCode LS PHP: Open Profiling Dashboard"
+      },
+      {
+        "command": "vscode-ls-php.resetProfilingMetrics",
+        "title": "VSCode LS PHP: Reset Profiling Metrics"
+      }
+    ],
+    "configuration": {
+      "title": "VSCode LS PHP",
+      "properties": {
+        "vscodeLsPhp.serverPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional absolute path to the Rust language server binary."
+        },
+        "vscodeLsPhp.phpExecutable": {
+          "type": "string",
+          "default": "php",
+          "description": "PHP executable used for PHPUnit/Pest/Artisan test runs."
+        },
+        "vscodeLsPhp.phpunitBinary": {
+          "type": "string",
+          "default": "vendor/bin/phpunit",
+          "description": "Relative path to PHPUnit binary from workspace root."
+        },
+        "vscodeLsPhp.pestBinary": {
+          "type": "string",
+          "default": "vendor/bin/pest",
+          "description": "Relative path to Pest binary from workspace root."
+        },
+        "vscodeLsPhp.enableContinuousTesting": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically rerun tests on changes under tests/**/*.php when continuous testing is enabled."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test": "node ./test/runTest.js"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.9",
+    "@types/vscode": "^1.90.0",
+    "@vscode/test-electron": "^2.4.1",
+    "glob": "^11.0.0",
+    "mocha": "^10.7.3",
+    "typescript": "^5.5.2"
+  }
+}
