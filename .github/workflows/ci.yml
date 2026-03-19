@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  build-server:
+    name: Build Rust Server (${{ matrix.os }} / ${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build server
+        run: cargo build --release --manifest-path server/Cargo.toml --target ${{ matrix.target }}
+
+      - name: Test server (native host targets only)
+        if: |
+          matrix.target == 'x86_64-unknown-linux-gnu' ||
+          matrix.target == 'x86_64-pc-windows-msvc' ||
+          matrix.target == 'x86_64-apple-darwin'
+        run: cargo test --manifest-path server/Cargo.toml
+
+  build-extension:
+    name: Build Extension
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install and compile extension
+        run: |
+          cd extension
+          npm ci
+          npm run compile
+
+      - name: Install xvfb for extension tests
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+
+      - name: Run extension integration tests
+        run: |
+          cd extension
+          xvfb-run -a npm test
+
+  performance-gate:
+    name: Performance Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build server (release)
+        run: cargo build --release --manifest-path server/Cargo.toml
+
+      - name: Run benchmark gate
+        run: |
+          node scripts/lsp-benchmark.js \
+            --server server/target/release/vscode-ls-php-server \
+            --workspace sample-php-project \
+            --output benchmark-results.json \
+            --fail-on-threshold \
+            --max-completion-p95-ms 30 \
+            --max-hover-p95-ms 20
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: benchmark-results.json

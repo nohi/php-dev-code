@@ -1,0 +1,12 @@
+node_modules/
+dist/
+out/
+.vscode-test/
+*.vsix
+extension/node_modules/
+extension/out/
+server/target/
+.DS_Store
+Thumbs.db
+
+sample-php-project/

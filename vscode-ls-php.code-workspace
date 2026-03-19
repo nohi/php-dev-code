@@ -1,0 +1,22 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"chat.customAgentInSubagent.enabled": true,
+		"chat.tools.terminal.autoApprove": {
+			"cargo check": true,
+			"cargo test": true,
+			"npm run compile": true,
+			"cargo build": true,
+			"npm install": true,
+			"npm test": true,
+			"npm --prefix extension": true,
+			"Push-Location": true,
+			"Pop-Location": true,
+			"npm run bench:gate": true
+		}
+	}
+}

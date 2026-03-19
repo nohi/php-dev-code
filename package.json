@@ -1,0 +1,12 @@
+{
+  "name": "vscode-ls-php-monorepo",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "build": "npm --prefix extension run compile && cargo build --manifest-path server/Cargo.toml",
+    "build:extension": "npm --prefix extension run compile",
+    "build:server": "cargo build --manifest-path server/Cargo.toml",
+    "bench:server": "node scripts/lsp-benchmark.js",
+    "bench:gate": "node scripts/lsp-benchmark.js --fail-on-threshold --max-completion-p95-ms 30 --max-hover-p95-ms 20"
+  }
+}
