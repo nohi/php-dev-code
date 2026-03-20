@@ -46,6 +46,70 @@ const itemMetadata = new WeakMap<vscode.TestItem, TestMetadata>();
 const requestMetrics = new Map<string, RequestMetric>();
 const recentTestRuns: TestRunMetric[] = [];
 
+// Map from URI string → Map<line, pass(true)/fail(false)>
+const testResultsByUri = new Map<string, Map<number, boolean>>();
+
+// Decoration types for test result gutter indicators (created lazily)
+let passDecorationType: vscode.TextEditorDecorationType | undefined;
+let failDecorationType: vscode.TextEditorDecorationType | undefined;
+
+function getPassDecorationType(): vscode.TextEditorDecorationType {
+  if (!passDecorationType) {
+    passDecorationType = vscode.window.createTextEditorDecorationType({
+      after: {
+        contentText: " ✓",
+        color: new vscode.ThemeColor("testing.iconPassed"),
+        margin: "0 0 0 1em",
+      },
+    });
+  }
+  return passDecorationType;
+}
+
+function getFailDecorationType(): vscode.TextEditorDecorationType {
+  if (!failDecorationType) {
+    failDecorationType = vscode.window.createTextEditorDecorationType({
+      after: {
+        contentText: " ✗",
+        color: new vscode.ThemeColor("testing.iconFailed"),
+        margin: "0 0 0 1em",
+      },
+    });
+  }
+  return failDecorationType;
+}
+
+function applyTestDecorations(editor: vscode.TextEditor): void {
+  const uriKey = editor.document.uri.toString();
+  const results = testResultsByUri.get(uriKey);
+  if (!results) {
+    editor.setDecorations(getPassDecorationType(), []);
+    editor.setDecorations(getFailDecorationType(), []);
+    return;
+  }
+
+  const passRanges: vscode.Range[] = [];
+  const failRanges: vscode.Range[] = [];
+
+  for (const [line, passed] of results) {
+    const range = new vscode.Range(line, 0, line, 0);
+    if (passed) {
+      passRanges.push(range);
+    } else {
+      failRanges.push(range);
+    }
+  }
+
+  editor.setDecorations(getPassDecorationType(), passRanges);
+  editor.setDecorations(getFailDecorationType(), failRanges);
+}
+
+function applyTestDecorationsToAllEditors(): void {
+  for (const editor of vscode.window.visibleTextEditors) {
+    applyTestDecorations(editor);
+  }
+}
+
 function rememberTestRun(label: string, ok: boolean, durationMs: number): void {
   recentTestRuns.push({ label, ok, durationMs });
   while (recentTestRuns.length > 30) {
@@ -152,6 +216,15 @@ async function stopClient(): Promise<void> {
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   initializeTestExplorer(context);
 
+  // Apply test decorations when an editor becomes visible
+  context.subscriptions.push(
+    vscode.window.onDidChangeActiveTextEditor((editor) => {
+      if (editor) {
+        applyTestDecorations(editor);
+      }
+    }),
+  );
+
   context.subscriptions.push(
     vscode.commands.registerCommand("vscode-ls-php.restartServer", async () => {
       await stopClient();
@@ -206,11 +279,82 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   await startClient(context);
+
+  // Format-on-save
+  context.subscriptions.push(
+    vscode.workspace.onWillSaveTextDocument((event) => {
+      const doc = event.document;
+      if (doc.languageId !== "php" && doc.languageId !== "blade") {
+        return;
+      }
+      const cfg = vscode.workspace.getConfiguration("vscodeLsPhp", doc.uri);
+      if (!cfg.get<boolean>("formatOnSave", false)) {
+        return;
+      }
+      event.waitUntil(
+        vscode.commands.executeCommand<vscode.TextEdit[]>(
+          "vscode.executeFormatDocumentProvider",
+          doc.uri,
+          { insertSpaces: true, tabSize: 4 },
+        ).then((edits) => edits ?? []),
+      );
+    }),
+  );
+
+  // Format-on-paste
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeTextDocument((event) => {
+      const doc = event.document;
+      if (doc.languageId !== "php" && doc.languageId !== "blade") {
+        return;
+      }
+      const cfg = vscode.workspace.getConfiguration("vscodeLsPhp", doc.uri);
+      if (!cfg.get<boolean>("formatOnPaste", false)) {
+        return;
+      }
+      // Detect paste: single content change that spans multiple characters or lines
+      if (event.contentChanges.length !== 1) {
+        return;
+      }
+      const change = event.contentChanges[0];
+      const isMultiLine = change.text.includes("\n");
+      const isLongPaste = change.text.length > 10 && !change.text.match(/^\s+$/);
+      if (!isMultiLine && !isLongPaste) {
+        return;
+      }
+      // Format the pasted range
+      const pastedLines = change.text.split("\n").length;
+      const pasteStartLine = change.range.start.line;
+      const pasteEndLine = pasteStartLine + pastedLines - 1;
+      const rangeToFormat = new vscode.Range(
+        pasteStartLine, 0,
+        pasteEndLine, doc.lineAt(Math.min(pasteEndLine, doc.lineCount - 1)).text.length,
+      );
+      void vscode.commands.executeCommand<vscode.TextEdit[]>(
+        "vscode.executeFormatRangeProvider",
+        doc.uri,
+        rangeToFormat,
+        { insertSpaces: true, tabSize: 4 },
+      ).then((edits) => {
+        if (!edits || edits.length === 0) {
+          return;
+        }
+        const wsEdit = new vscode.WorkspaceEdit();
+        wsEdit.set(doc.uri, edits);
+        return vscode.workspace.applyEdit(wsEdit);
+      });
+    }),
+  );
+
   await refreshWorkspaceTests();
 }
 
 export async function deactivate(): Promise<void> {
   stopContinuousTesting();
+  passDecorationType?.dispose();
+  passDecorationType = undefined;
+  failDecorationType?.dispose();
+  failDecorationType = undefined;
   if (testController) {
     testController.dispose();
     testController = undefined;
@@ -255,6 +399,8 @@ async function refreshWorkspaceTests(): Promise<void> {
     return;
   }
 
+  testResultsByUri.clear();
+  applyTestDecorationsToAllEditors();
   testController.items.replace([]);
   const files = await vscode.workspace.findFiles("**/tests/**/*.php", "**/{vendor,node_modules,.git}/**");
 
@@ -375,6 +521,14 @@ async function executeTestRun(
       const result = await runSingleTestTarget(metadata, debugMode, token);
       const ms = result.durationMs;
       rememberTestRun(item.label, result.ok, ms);
+      // Store gutter indicator result
+      const uriKey = metadata.uri.toString();
+      if (item.range) {
+        if (!testResultsByUri.has(uriKey)) {
+          testResultsByUri.set(uriKey, new Map());
+        }
+        testResultsByUri.get(uriKey)!.set(item.range.start.line, result.ok);
+      }
       run.appendOutput(`\n[${result.ok ? "PASS" : "FAIL"}] ${item.label}\n${result.command}\n${result.output}\n`);
       if (result.ok) {
         run.passed(item, ms);
@@ -388,6 +542,7 @@ async function executeTestRun(
   }
 
   run.end();
+  applyTestDecorationsToAllEditors();
 }
 
 function collectRequestedItems(request: vscode.TestRunRequest): vscode.TestItem[] {

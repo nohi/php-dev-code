@@ -9,6 +9,10 @@ use super::{
         identifier_at_position, is_blade_uri, is_code_position, is_php_uri, is_valid_identifier_name,
         import_action_for_fqn,
         parse_namespace_declaration, parse_single_use_entry, parse_use_aliases,
+        parse_diagnostic_filter_config_text,
+        parse_php_target_version,
+        path_matches_directory_rule,
+        is_diagnostic_enabled_for_path,
         collect_folding_ranges,
         collect_parameter_inlay_hints_for_range,
         collect_return_type_inlay_hints_for_range,
@@ -22,10 +26,15 @@ use super::{
         detect_undefined_function_calls,
         detect_undefined_function_calls_with_known,
         detect_operator_confusion,
+        detect_comment_task_markers,
+        detect_php_version_compatibility,
+        detect_deprecated_usages,
         extract_laravel_route_names_from_text,
         extract_php_array_keys,
+        extract_blade_section_names_from_text,
         extract_phpstorm_meta_override_function_names,
         laravel_string_completion_context,
+        blade_section_string_completion_context,
         looks_like_blade_template,
         reference_count_title,
         reference_locations_for_symbol,
@@ -44,12 +53,14 @@ use super::{
         format_range_line_edit,
         format_current_line_edit,
         format_range_text,
+        generate_phpdoc_on_enter,
         call_ranges_for_name,
         find_symbol_location_for_queries,
         find_type_definition_in_index,
         function_call_context,
         format_symbol_for_hover,
         format_symbol_for_hover_with_templates,
+        extract_mixin_types_from_docblock,
         extract_template_params_from_docblock,
         is_type_symbol_kind,
         php_manual_function_url,
@@ -105,6 +116,115 @@ use super::{
         assert!(symbols.iter().any(|s| s.name == "Demo" && s.kind == SymbolKind::CLASS));
         assert!(symbols.iter().any(|s| s.name == "run_test" && s.kind == SymbolKind::FUNCTION));
         assert!(symbols.iter().any(|s| s.name == "VERSION" && s.kind == SymbolKind::CONSTANT));
+    }
+
+    #[test]
+    fn parses_diagnostic_filter_config_text_with_rules_and_paths() {
+        let cfg = parse_diagnostic_filter_config_text(
+            r#"{
+  "diagnostics": {
+    "disableRules": ["unused-import"],
+    "disableInPaths": {
+      "undefined-variable": ["tests/**", "vendor/"]
+    }
+  }
+}"#,
+        );
+
+        assert!(cfg.disabled_rules.contains("unused-import"));
+        assert_eq!(
+            cfg.disabled_in_paths
+                .get("undefined-variable")
+                .cloned()
+                .unwrap_or_default(),
+            vec!["tests/**".to_string(), "vendor/".to_string()]
+        );
+    }
+
+    #[test]
+    fn matches_directory_rules_with_and_without_glob_suffix() {
+        assert!(path_matches_directory_rule("tests/Feature/UserTest.php", "tests/**"));
+        assert!(path_matches_directory_rule("vendor/laravel/framework.php", "vendor/"));
+        assert!(!path_matches_directory_rule("app/Http/Controller.php", "tests/**"));
+    }
+
+    #[test]
+    fn disables_diagnostics_by_rule_and_path() {
+        let cfg = parse_diagnostic_filter_config_text(
+            r#"{
+  "diagnostics": {
+    "disableRules": ["unused-import"],
+    "disableInPaths": {
+      "undefined-variable": ["tests/**"]
+    }
+  }
+}"#,
+        );
+
+        let undefined_var = Diagnostic {
+            range: Range::new(Position::new(0, 0), Position::new(0, 2)),
+            severity: Some(DiagnosticSeverity::WARNING),
+            message: "Undefined variable: $x".to_string(),
+            source: Some("vscode-ls-php".to_string()),
+            ..Diagnostic::default()
+        };
+        let unused_import = Diagnostic {
+            range: Range::new(Position::new(0, 0), Position::new(0, 3)),
+            severity: Some(DiagnosticSeverity::HINT),
+            message: "Unused import: User".to_string(),
+            source: Some("vscode-ls-php".to_string()),
+            ..Diagnostic::default()
+        };
+                let todo_comment = Diagnostic {
+                        range: Range::new(Position::new(0, 0), Position::new(0, 4)),
+                        severity: Some(DiagnosticSeverity::HINT),
+                        message: "Comment task marker: TODO".to_string(),
+                        source: Some("vscode-ls-php".to_string()),
+                        ..Diagnostic::default()
+                };
+
+                let cfg_with_todo_rule = parse_diagnostic_filter_config_text(
+                        r#"{
+    "diagnostics": {
+        "disableRules": ["todo-comment"]
+    }
+}"#,
+                );
+
+        assert!(!is_diagnostic_enabled_for_path(
+            &undefined_var,
+            Some("tests/Feature/UserTest.php"),
+            &cfg
+        ));
+        assert!(is_diagnostic_enabled_for_path(
+            &undefined_var,
+            Some("app/Http/Controller.php"),
+            &cfg
+        ));
+        assert!(!is_diagnostic_enabled_for_path(
+            &unused_import,
+            Some("app/Http/Controller.php"),
+            &cfg
+        ));
+        assert!(!is_diagnostic_enabled_for_path(
+            &todo_comment,
+            Some("app/Http/Controller.php"),
+            &cfg_with_todo_rule
+        ));
+    }
+
+    #[test]
+    fn parses_php_target_version_from_diagnostic_config() {
+        let cfg = parse_diagnostic_filter_config_text(
+            r#"{
+  "diagnostics": {
+    "phpTargetVersion": "7.4"
+  }
+}"#,
+        );
+        assert_eq!(cfg.php_target_version, Some((7, 4)));
+        assert_eq!(parse_php_target_version("8.1"), Some((8, 1)));
+        assert!(parse_php_target_version("8").is_none());
     }
 
     #[test]
@@ -255,6 +375,25 @@ use super::{
         let config_source = "<?php\nconfig(\"app.name\");\n";
         let config_ctx = laravel_string_completion_context(config_source, Position::new(1, 12), "config");
         assert_eq!(config_ctx, Some('"'));
+    }
+
+    #[test]
+    fn detects_blade_section_string_completion_context() {
+        let source = "@extends('layouts.app')\n@section('cont')\n";
+        let section_ctx = blade_section_string_completion_context(source, Position::new(1, 14));
+        assert_eq!(section_ctx, Some('\''));
+
+        let source2 = "@yield(\"header\")\n";
+        let yield_ctx = blade_section_string_completion_context(source2, Position::new(0, 11));
+        assert_eq!(yield_ctx, Some('"'));
+    }
+
+    #[test]
+    fn extracts_blade_section_names_from_yield_and_section() {
+        let source = "@yield('content')\n@section(\"header\")\n";
+        let names = extract_blade_section_names_from_text(source);
+        assert!(names.contains("content"));
+        assert!(names.contains("header"));
     }
 
     #[test]
@@ -1125,6 +1264,260 @@ $repo->fi
             .and_then(|o| o.get("memberType"))
             .and_then(|v| v.as_str());
         assert_eq!(member_type, Some("App\\Models\\User"));
+    }
+
+    #[tokio::test]
+    async fn completion_response_includes_instance_members_from_mixin_docblock() {
+        let captured_client = Arc::new(Mutex::new(None));
+        let captured_client_for_service = Arc::clone(&captured_client);
+        let (_service, _socket) = LspService::new(move |client| {
+            *captured_client_for_service
+                .lock()
+                .expect("client mutex") = Some(client.clone());
+            Backend {
+                client,
+                documents: RwLock::new(HashMap::new()),
+                symbols: RwLock::new(HashMap::new()),
+                workspace_folders: RwLock::new(Vec::new()),
+                open_documents: RwLock::new(HashSet::new()),
+            }
+        });
+
+        let client = captured_client
+            .lock()
+            .expect("client mutex")
+            .take()
+            .expect("captured client");
+        let backend = Backend {
+            client,
+            documents: RwLock::new(HashMap::new()),
+            symbols: RwLock::new(HashMap::new()),
+            workspace_folders: RwLock::new(Vec::new()),
+            open_documents: RwLock::new(HashSet::new()),
+        };
+
+        let uri = Url::parse("file:///tmp/mixin-completion.php").expect("uri");
+        let source = "<?php
+namespace App\\Core;
+
+class MagicMixin {
+  public function fromMixin(): string {}
+}
+
+/** @mixin App\\Core\\MagicMixin */
+class Repository {
+}
+
+$repo = new Repository();
+$repo->fr
+";
+        backend.update_document(uri.clone(), source.to_string()).await;
+
+        let response = backend
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: Position::new(12, 8),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .expect("completion result")
+            .expect("completion response");
+
+        let items = match response {
+            tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
+            tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
+        };
+
+        let mixin_item = items
+            .iter()
+            .find(|item| {
+                item.label == "fromMixin"
+                    && item
+                        .data
+                        .as_ref()
+                        .and_then(|v| v.as_object())
+                        .and_then(|o| o.get("memberOf"))
+                        .and_then(|v| v.as_str())
+                        == Some("App\\Core\\MagicMixin")
+            })
+            .expect("fromMixin member completion item");
+        assert_eq!(
+            mixin_item.detail.as_deref(),
+            Some("Instance member (mixin): string")
+        );
+        let member_of = mixin_item
+            .data
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .and_then(|o| o.get("memberOf"))
+            .and_then(|v| v.as_str());
+        assert_eq!(member_of, Some("App\\Core\\MagicMixin"));
+    }
+
+    #[tokio::test]
+    async fn completion_response_adds_auto_import_with_alias_on_conflict() {
+        let captured_client = Arc::new(Mutex::new(None));
+        let captured_client_for_service = Arc::clone(&captured_client);
+        let (_service, _socket) = LspService::new(move |client| {
+            *captured_client_for_service
+                .lock()
+                .expect("client mutex") = Some(client.clone());
+            Backend {
+                client,
+                documents: RwLock::new(HashMap::new()),
+                symbols: RwLock::new(HashMap::new()),
+                workspace_folders: RwLock::new(Vec::new()),
+                open_documents: RwLock::new(HashSet::new()),
+            }
+        });
+
+        let client = captured_client
+            .lock()
+            .expect("client mutex")
+            .take()
+            .expect("captured client");
+        let backend = Backend {
+            client,
+            documents: RwLock::new(HashMap::new()),
+            symbols: RwLock::new(HashMap::new()),
+            workspace_folders: RwLock::new(Vec::new()),
+            open_documents: RwLock::new(HashSet::new()),
+        };
+
+        let current_uri = Url::parse("file:///tmp/auto-import-current.php").expect("current uri");
+        let current_source = "<?php
+namespace App\\Http\\Controllers;
+use App\\Models\\User;
+
+class Controller {
+  public function run() {
+    Us
+  }
+}
+";
+        backend
+            .update_document(current_uri.clone(), current_source.to_string())
+            .await;
+
+        let service_uri = Url::parse("file:///tmp/auto-import-service.php").expect("service uri");
+        let service_source = "<?php
+namespace App\\Services;
+
+class User {}
+";
+        backend
+            .update_document(service_uri, service_source.to_string())
+            .await;
+
+        let response = backend
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: current_uri.clone() },
+                    position: Position::new(6, 6),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .expect("completion result")
+            .expect("completion response");
+
+        let items = match response {
+            tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
+            tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
+        };
+
+        let target = items
+            .iter()
+            .find(|item| {
+                item.data
+                    .as_ref()
+                    .and_then(|v| v.as_str())
+                    .map(|s| s == "App\\Services\\User")
+                    .unwrap_or(false)
+            })
+            .expect("App\\Services\\User completion item");
+
+        assert_eq!(target.insert_text.as_deref(), Some("UserAlias"));
+        let edits = target
+            .additional_text_edits
+            .as_ref()
+            .expect("additional text edits");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "use App\\Services\\User as UserAlias;\n");
+    }
+
+    #[tokio::test]
+    async fn completion_response_suggests_blade_section_names_between_yield_and_section() {
+        let captured_client = Arc::new(Mutex::new(None));
+        let captured_client_for_service = Arc::clone(&captured_client);
+        let (_service, _socket) = LspService::new(move |client| {
+            *captured_client_for_service
+                .lock()
+                .expect("client mutex") = Some(client.clone());
+            Backend {
+                client,
+                documents: RwLock::new(HashMap::new()),
+                symbols: RwLock::new(HashMap::new()),
+                workspace_folders: RwLock::new(Vec::new()),
+                open_documents: RwLock::new(HashSet::new()),
+            }
+        });
+
+        let client = captured_client
+            .lock()
+            .expect("client mutex")
+            .take()
+            .expect("captured client");
+        let backend = Backend {
+            client,
+            documents: RwLock::new(HashMap::new()),
+            symbols: RwLock::new(HashMap::new()),
+            workspace_folders: RwLock::new(Vec::new()),
+            open_documents: RwLock::new(HashSet::new()),
+        };
+
+        let shared_uri = Url::parse("file:///tmp/layout.blade.php").expect("shared uri");
+        let shared_source = "@yield('content')\n";
+        backend
+            .update_document(shared_uri, shared_source.to_string())
+            .await;
+
+        let current_uri = Url::parse("file:///tmp/page.blade.php").expect("current uri");
+        let current_source = "@extends('layout')\n@section('co')\n";
+        backend
+            .update_document(current_uri.clone(), current_source.to_string())
+            .await;
+
+        let response = backend
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: current_uri.clone() },
+                    position: Position::new(1, 12),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .expect("completion result")
+            .expect("completion response");
+
+        let items = match response {
+            tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
+            tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
+        };
+
+        let content_item = items
+            .iter()
+            .find(|item| item.label == "content")
+            .expect("content section completion");
+        assert_eq!(content_item.detail.as_deref(), Some("Blade section"));
     }
 
     #[test]
@@ -2210,6 +2603,26 @@ $repo->fi
     }
 
     #[test]
+    fn collects_parameter_inlay_hints_for_by_reference_arguments() {
+        let source = "<?php\nfunction hydrate(array &$items, ?App\\Models\\User $owner) {}\nhydrate($items, $owner);\n";
+        let map = HashMap::from([(
+            "hydrate".to_string(),
+            vec![
+                "array &$items".to_string(),
+                "?App\\Models\\User $owner".to_string(),
+            ],
+        )]);
+
+        let hints = collect_parameter_inlay_hints_for_range(source, 2, 2, &map);
+        assert!(hints.iter().any(|hint| hint.2 == "&items (array):"));
+        assert!(
+            hints
+                .iter()
+                .any(|hint| hint.2 == "owner (?App\\Models\\User):")
+        );
+    }
+
+    #[test]
     fn collects_return_type_inlay_hints_for_functions_in_range() {
         let uri = Url::parse("file:///tmp/a.php").expect("uri");
         let symbols = HashMap::from([(
@@ -2321,6 +2734,24 @@ $repo->fi
 
         let params = extract_template_params_from_docblock(docblock);
         assert_eq!(params, vec!["TKey", "TValue", "TModel"]);
+    }
+
+    #[test]
+    fn extracts_mixin_types_from_docblock_tags() {
+        let docblock = "\
+/**
+ * @mixin App\\Support\\MagicMixin
+ * @phpstan-mixin ?App\\Services\\ExtraService|null
+ */";
+
+        let mixins = extract_mixin_types_from_docblock(docblock);
+        assert_eq!(
+            mixins,
+            vec![
+                "App\\Support\\MagicMixin".to_string(),
+                "App\\Services\\ExtraService".to_string(),
+            ]
+        );
     }
 
     #[test]

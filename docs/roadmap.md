@@ -17,10 +17,10 @@
 
 ### Phase 2 Reallocated Backlog (Status + Priority)
 
-- [-] [High] Auto-import with alias insertion directly from completion accept flow.
+- [x] [High] Auto-import with alias insertion directly from completion accept flow.
 - [-] [Medium] Signature help support for PHP 8 named arguments.
 - [-] [Medium] Go to Implementations expansion for traits and overridden functions.
-- [ ] [Medium] PHPDoc generator on `/**` trigger with keyword completion.
+- [x] [Medium] PHPDoc generator on `/**` trigger with keyword completion.
 - [-] [Low] Rich localized hover/tooltips (localized descriptions, styled headers, doc URLs).
 - [ ] [Low] PHAR content navigation and symbol/index integration.
 - [ ] [Low] Linked editing for local variable rename-in-place workflows.
@@ -37,13 +37,13 @@
 
 - [-] [High] Advanced code actions for namespace resolution, getter/setter generation, and interface implementation.
 - [-] [High] Extended code fixes for expression refactoring and broader common issue auto-fixes.
-- [ ] [High] Per-directory and per-rule diagnostics configurability.
-- [ ] [Medium] Deprecation diagnostics for libraries and user code.
-- [ ] [Medium] PHP version compatibility diagnostics.
-- [ ] [Medium] Native `@mixin` and additional advanced annotation support across IntelliSense.
+- [x] [High] Per-directory and per-rule diagnostics configurability.
+- [x] [Medium] Deprecation diagnostics for libraries and user code.
+- [x] [Medium] PHP version compatibility diagnostics.
+- [-] [Medium] Native `@mixin` and additional advanced annotation support across IntelliSense.
 - [-] [Medium] Inlay hints expansion for by-ref arguments and richer type annotations.
 - [-] [Low] Significant semantic rule-set expansion beyond current baseline.
-- [ ] [Low] TODO highlighting in comments and doc comments.
+- [x] [Low] TODO highlighting in comments and doc comments.
 
 ## Phase 4: Frameworks and Mixed Languages (4-8 weeks)
 
@@ -60,7 +60,7 @@
 - [-] [Medium] Rich Laravel model/query/view/config/path tooltips with detailed metadata.
 - [ ] [Medium] Composer ecosystem integration (`composer.json` IntelliSense/diagnostics/actions).
 - [-] [Medium] Full PSR-12 formatter compliance mode.
-- [ ] [Medium] Format-on-paste / format-on-type / format-on-save behavior controls.
+- [x] [Medium] Format-on-paste / format-on-type / format-on-save behavior controls.
 - [ ] [Medium] Laravel built-in dev server assisted run/debug workflow.
 - [ ] [Low] Multiple style presets (`PER`, `PSR-12`, `PSR-2`, `Allman`, `K&R`, `Laravel`, `Drupal`, `WordPress`).
 - [ ] [Low] Custom formatting rule configuration.
@@ -85,7 +85,7 @@
 - [ ] [Medium] Pest High-Order Tests intelligence and analysis support.
 - [-] [Medium] PHPUnit test-case profiling results visualization.
 - [ ] [Medium] DataSet-level test discovery and per-dataset run support.
-- [ ] [Low] In-editor latest test result gutter/margin indicators.
+- [x] [Low] In-editor latest test result gutter/margin indicators.
 - [ ] [Low] Test run hooks (`preTask` / `postTask`) integration.
 
 ## Performance and Quality Gates

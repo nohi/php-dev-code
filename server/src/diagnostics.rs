@@ -348,6 +348,233 @@ pub(crate) fn detect_operator_confusion(text: &str) -> Vec<Diagnostic> {
     diagnostics
 }
 
+pub(crate) fn detect_comment_task_markers(text: &str) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let mut in_block_comment = false;
+
+    for (line_idx, line) in text.lines().enumerate() {
+        let chars: Vec<char> = line.chars().collect();
+        let comment_line = comment_text_for_line(&chars, &mut in_block_comment);
+
+        for (marker, label) in [("todo", "TODO"), ("fixme", "FIXME")] {
+            for start in comment_marker_offsets(&comment_line, marker) {
+                diagnostics.push(Diagnostic {
+                    range: Range::new(
+                        Position::new(line_idx as u32, start as u32),
+                        Position::new(line_idx as u32, (start + marker.len()) as u32),
+                    ),
+                    severity: Some(DiagnosticSeverity::HINT),
+                    message: format!("Comment task marker: {label}"),
+                    source: Some("vscode-ls-php".to_string()),
+                    ..Diagnostic::default()
+                });
+            }
+        }
+    }
+
+    diagnostics
+}
+
+fn comment_marker_offsets(comment_line: &str, marker: &str) -> Vec<usize> {
+    let lowered = comment_line
+        .chars()
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let marker_chars = marker.chars().collect::<Vec<_>>();
+    if marker_chars.is_empty() || lowered.len() < marker_chars.len() {
+        return Vec::new();
+    }
+
+    let marker_len = marker_chars.len();
+    let mut out = Vec::new();
+
+    for i in 0..=(lowered.len() - marker_len) {
+        if lowered[i..(i + marker_len)] != marker_chars[..] {
+            continue;
+        }
+
+        let prev = if i == 0 { ' ' } else { lowered[i - 1] };
+        let next = if i + marker_len >= lowered.len() {
+            ' '
+        } else {
+            lowered[i + marker_len]
+        };
+
+        if marker_boundary(prev) && marker_boundary(next) {
+            out.push(i);
+        }
+    }
+
+    out
+}
+
+fn marker_boundary(ch: char) -> bool {
+    !ch.is_ascii_alphanumeric() && ch != '_'
+}
+
+pub(crate) fn detect_php_version_compatibility(
+    text: &str,
+    target_version: (u32, u32),
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let mut in_block_comment = false;
+
+    for (line_idx, line) in text.lines().enumerate() {
+        let chars: Vec<char> = line.chars().collect();
+        let mask = code_mask_for_line(&chars, &mut in_block_comment);
+        let sanitized = chars
+            .iter()
+            .enumerate()
+            .map(|(idx, ch)| if mask.get(idx).copied().unwrap_or(false) { *ch } else { ' ' })
+            .collect::<String>();
+        let trimmed = sanitized.trim_start();
+        let trim_offset = sanitized.len().saturating_sub(trimmed.len());
+
+        if version_less_than(target_version, (8, 0)) {
+            if let Some(col) = nullsafe_operator_offset(&chars, &mask) {
+                diagnostics.push(version_compat_diagnostic(
+                    line_idx as u32,
+                    col as u32,
+                    (col + 3) as u32,
+                    target_version,
+                    (8, 0),
+                    "nullsafe operator ?->",
+                ));
+            }
+
+            if let Some(col) = keyword_call_offset(trimmed, "match") {
+                let actual_col = col + trim_offset;
+                diagnostics.push(version_compat_diagnostic(
+                    line_idx as u32,
+                    actual_col as u32,
+                    (actual_col + 5) as u32,
+                    target_version,
+                    (8, 0),
+                    "match expression",
+                ));
+            }
+        }
+
+        if version_less_than(target_version, (8, 1)) {
+            if let Some(col) = token_after_keyword_offset(trimmed, "enum") {
+                let actual_col = col + trim_offset;
+                diagnostics.push(version_compat_diagnostic(
+                    line_idx as u32,
+                    actual_col as u32,
+                    (actual_col + 4) as u32,
+                    target_version,
+                    (8, 1),
+                    "enum declaration",
+                ));
+            }
+
+            if let Some(col) = token_after_keyword_offset(trimmed, "readonly") {
+                let actual_col = col + trim_offset;
+                diagnostics.push(version_compat_diagnostic(
+                    line_idx as u32,
+                    actual_col as u32,
+                    (actual_col + 8) as u32,
+                    target_version,
+                    (8, 1),
+                    "readonly keyword",
+                ));
+            }
+        }
+    }
+
+    diagnostics
+}
+
+fn version_compat_diagnostic(
+    line: u32,
+    start: u32,
+    end: u32,
+    target: (u32, u32),
+    required: (u32, u32),
+    feature: &str,
+) -> Diagnostic {
+    Diagnostic {
+        range: Range::new(Position::new(line, start), Position::new(line, end)),
+        severity: Some(DiagnosticSeverity::WARNING),
+        message: format!(
+            "PHP version compatibility: '{}' requires PHP {}.{}+, target is {}.{}",
+            feature, required.0, required.1, target.0, target.1
+        ),
+        source: Some("vscode-ls-php".to_string()),
+        ..Diagnostic::default()
+    }
+}
+
+fn version_less_than(target: (u32, u32), required: (u32, u32)) -> bool {
+    target.0 < required.0 || (target.0 == required.0 && target.1 < required.1)
+}
+
+fn nullsafe_operator_offset(chars: &[char], mask: &[bool]) -> Option<usize> {
+    if chars.len() < 3 {
+        return None;
+    }
+    for i in 0..=(chars.len() - 3) {
+        if mask.get(i).copied().unwrap_or(false)
+            && mask.get(i + 1).copied().unwrap_or(false)
+            && mask.get(i + 2).copied().unwrap_or(false)
+            && chars[i] == '?'
+            && chars[i + 1] == '-'
+            && chars[i + 2] == '>'
+        {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn keyword_call_offset(trimmed_line: &str, keyword: &str) -> Option<usize> {
+    let chars = trimmed_line.chars().collect::<Vec<_>>();
+    let keyword_chars = keyword.chars().collect::<Vec<_>>();
+    if chars.len() < keyword_chars.len() {
+        return None;
+    }
+
+    let mut i = 0usize;
+    while i + keyword_chars.len() <= chars.len() {
+        if chars[i..(i + keyword_chars.len())] != keyword_chars[..] {
+            i += 1;
+            continue;
+        }
+
+        let before_ok = i == 0 || !chars[i - 1].is_ascii_alphanumeric();
+        let mut j = i + keyword_chars.len();
+        while j < chars.len() && chars[j].is_whitespace() {
+            j += 1;
+        }
+        let after_ok = j < chars.len() && chars[j] == '(';
+        if before_ok && after_ok {
+            return Some(i);
+        }
+
+        i += 1;
+    }
+
+    None
+}
+
+fn token_after_keyword_offset(trimmed_line: &str, keyword: &str) -> Option<usize> {
+    if !trimmed_line.starts_with(keyword) {
+        return None;
+    }
+
+    let tail = &trimmed_line[keyword.len()..];
+    if tail.is_empty() {
+        return Some(0);
+    }
+
+    let first = tail.chars().next();
+    if matches!(first, Some(ch) if ch.is_whitespace()) {
+        return Some(0);
+    }
+
+    None
+}
+
 pub(crate) fn detect_undefined_function_calls(text: &str) -> Vec<Diagnostic> {
     let known = HashSet::new();
     detect_undefined_function_calls_with_known(text, &known)
@@ -709,6 +936,184 @@ pub(crate) fn detect_undefined_methods(text: &str) -> Vec<Diagnostic> {
     }
 
     diagnostics
+}
+
+pub(crate) fn detect_deprecated_usages(text: &str) -> Vec<Diagnostic> {
+    let (deprecated_functions, deprecated_types) = collect_deprecated_declarations(text);
+    if deprecated_functions.is_empty() && deprecated_types.is_empty() {
+        return Vec::new();
+    }
+
+    let lines = text.lines().collect::<Vec<_>>();
+    let mut diagnostics = Vec::new();
+    let mut in_block_comment = false;
+
+    for (line_idx, line) in lines.iter().enumerate() {
+        let chars = line.chars().collect::<Vec<_>>();
+        let mask = code_mask_for_line(&chars, &mut in_block_comment);
+
+        let mut i = 0usize;
+        while i < chars.len() {
+            if !mask.get(i).copied().unwrap_or(false)
+                || (!chars[i].is_ascii_alphabetic() && chars[i] != '_')
+            {
+                i += 1;
+                continue;
+            }
+
+            let start = i;
+            i += 1;
+            while i < chars.len()
+                && mask.get(i).copied().unwrap_or(false)
+                && (chars[i].is_ascii_alphanumeric() || chars[i] == '_')
+            {
+                i += 1;
+            }
+
+            let name = chars[start..i].iter().collect::<String>();
+            let lowered = name.to_ascii_lowercase();
+            let prev_non_space = chars[..start]
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(idx, ch)| mask.get(*idx).copied().unwrap_or(false) && !ch.is_whitespace())
+                .map(|(_, ch)| *ch);
+
+            let mut j = i;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+
+            let is_call = j < chars.len() && chars[j] == '(';
+            if is_call {
+                if matches!(prev_non_space, Some('$' | '&')) {
+                    continue;
+                }
+                if let Some(decl_line) = deprecated_functions.get(&lowered) {
+                    if *decl_line != line_idx
+                        && prev_non_space != Some('>')
+                        && prev_non_space != Some(':')
+                    {
+                        diagnostics.push(Diagnostic {
+                            range: Range::new(
+                                Position::new(line_idx as u32, start as u32),
+                                Position::new(line_idx as u32, i as u32),
+                            ),
+                            severity: Some(DiagnosticSeverity::WARNING),
+                            message: format!("Deprecated symbol used: {}", name),
+                            source: Some("vscode-ls-php".to_string()),
+                            ..Diagnostic::default()
+                        });
+                    }
+                }
+                continue;
+            }
+
+            let is_new_expression = lowered == "new";
+            if is_new_expression {
+                let mut k = i;
+                while k < chars.len() && chars[k].is_whitespace() {
+                    k += 1;
+                }
+                if k < chars.len() && chars[k] == '\\' {
+                    k += 1;
+                }
+                if k >= chars.len() || (!chars[k].is_ascii_alphabetic() && chars[k] != '_') {
+                    continue;
+                }
+
+                let type_start = k;
+                k += 1;
+                while k < chars.len() && (chars[k].is_ascii_alphanumeric() || chars[k] == '_' || chars[k] == '\\') {
+                    k += 1;
+                }
+                let type_name = chars[type_start..k].iter().collect::<String>();
+                let short = type_name.rsplit('\\').next().unwrap_or(type_name.as_str());
+                let short_lower = short.to_ascii_lowercase();
+
+                if let Some(decl_line) = deprecated_types.get(&short_lower) {
+                    if *decl_line != line_idx {
+                        diagnostics.push(Diagnostic {
+                            range: Range::new(
+                                Position::new(line_idx as u32, type_start as u32),
+                                Position::new(line_idx as u32, k as u32),
+                            ),
+                            severity: Some(DiagnosticSeverity::WARNING),
+                            message: format!("Deprecated symbol used: {}", short),
+                            source: Some("vscode-ls-php".to_string()),
+                            ..Diagnostic::default()
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    diagnostics
+}
+
+fn collect_deprecated_declarations(text: &str) -> (HashMap<String, usize>, HashMap<String, usize>) {
+    let mut deprecated_functions = HashMap::new();
+    let mut deprecated_types = HashMap::new();
+    let lines = text.lines().collect::<Vec<_>>();
+
+    for (line_idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if let Some(name) = token_after_keyword(trimmed, "function") {
+            if let Some(docblock) = get_nearby_docblock(lines.as_slice(), line_idx) {
+                if docblock.to_ascii_lowercase().contains("@deprecated") {
+                    deprecated_functions.insert(name.to_ascii_lowercase(), line_idx);
+                }
+            }
+            continue;
+        }
+
+        for keyword in ["class", "interface", "trait", "enum"] {
+            if let Some(name) = token_after_keyword(trimmed, keyword) {
+                if let Some(docblock) = get_nearby_docblock(lines.as_slice(), line_idx) {
+                    if docblock.to_ascii_lowercase().contains("@deprecated") {
+                        deprecated_types.insert(name.to_ascii_lowercase(), line_idx);
+                    }
+                }
+            }
+        }
+    }
+
+    (deprecated_functions, deprecated_types)
+}
+
+fn get_nearby_docblock(lines: &[&str], declaration_line_idx: usize) -> Option<String> {
+    const MAX_DOCBLOCK_LOOKBACK: usize = 10;
+    if declaration_line_idx == 0 {
+        return None;
+    }
+
+    let mut idx = declaration_line_idx as isize - 1;
+    let min_idx = declaration_line_idx.saturating_sub(MAX_DOCBLOCK_LOOKBACK) as isize;
+
+    while idx >= min_idx && lines[idx as usize].trim().is_empty() {
+        idx -= 1;
+    }
+    if idx < min_idx {
+        return None;
+    }
+
+    if !lines[idx as usize].trim_end().ends_with("*/") {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    while idx >= min_idx {
+        let line = lines[idx as usize].trim();
+        parts.push(line.to_string());
+        if line.starts_with("/**") {
+            parts.reverse();
+            return Some(parts.join("\n"));
+        }
+        idx -= 1;
+    }
+
+    None
 }
 
 fn collect_class_method_scopes(text: &str) -> Vec<ClassMethodScope> {

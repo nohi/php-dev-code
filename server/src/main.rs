@@ -47,13 +47,17 @@ use formatting::{
     format_document,
     format_range_line_edit,
     format_range_text,
+    generate_phpdoc_on_enter,
     looks_like_blade_template,
 };
 use diagnostics::{
     detect_brace_mismatch,
+    detect_comment_task_markers,
     detect_duplicate_imports,
+    detect_php_version_compatibility,
     detect_missing_return_types,
     detect_operator_confusion,
+    detect_deprecated_usages,
     detect_undefined_function_calls,
     detect_undefined_function_calls_with_known,
     detect_undefined_methods,
@@ -93,6 +97,13 @@ struct Backend {
     symbols: RwLock<HashMap<Url, Vec<PhpSymbol>>>,
     workspace_folders: RwLock<Vec<Url>>,
     open_documents: RwLock<HashSet<Url>>,
+}
+
+#[derive(Clone, Default)]
+struct DiagnosticFilterConfig {
+    disabled_rules: HashSet<String>,
+    disabled_in_paths: HashMap<String, Vec<String>>,
+    php_target_version: Option<(u32, u32)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -173,6 +184,12 @@ impl Backend {
 
     async fn publish_diagnostics(&self, uri: &Url, text: &str) {
         let mut diagnostics: Vec<Diagnostic> = Vec::new();
+        let workspace_roots = {
+            let folders = self.workspace_folders.read().await;
+            folders.clone()
+        };
+        let config = load_diagnostic_filter_config(&workspace_roots);
+        let relative_path = relative_workspace_path(uri, &workspace_roots);
 
         if !is_blade_uri(uri) && !text.contains("<?php") {
             diagnostics.push(Diagnostic {
@@ -201,6 +218,8 @@ impl Backend {
 
         diagnostics.extend(detect_brace_mismatch(text));
         diagnostics.extend(detect_operator_confusion(text));
+        diagnostics.extend(detect_comment_task_markers(text));
+        diagnostics.extend(detect_deprecated_usages(text));
         let known_meta_functions = self.collect_workspace_phpstorm_meta_functions().await;
         diagnostics.extend(detect_undefined_function_calls_with_known(
             text,
@@ -212,6 +231,12 @@ impl Backend {
         diagnostics.extend(detect_unused_imports(text));
         diagnostics.extend(detect_duplicate_imports(text));
         diagnostics.extend(detect_missing_return_types(text));
+        if let Some(target) = config.php_target_version {
+            diagnostics.extend(detect_php_version_compatibility(text, target));
+        }
+        diagnostics.retain(|diag| {
+            is_diagnostic_enabled_for_path(diag, relative_path.as_deref(), &config)
+        });
 
         self.client
             .publish_diagnostics(uri.clone(), diagnostics, None)
@@ -374,7 +399,7 @@ impl LanguageServer for Backend {
                 document_range_formatting_provider: Some(OneOf::Left(true)),
                 document_on_type_formatting_provider: Some(DocumentOnTypeFormattingOptions {
                     first_trigger_character: ";".to_string(),
-                    more_trigger_character: Some(vec!["}".to_string()]),
+                    more_trigger_character: Some(vec!["}".to_string(), "\n".to_string()]),
                 }),
                 folding_range_provider: Some(
                     tower_lsp::lsp_types::FoldingRangeProviderCapability::Simple(true),
@@ -556,6 +581,9 @@ impl LanguageServer for Backend {
         let config_context = text
             .as_deref()
             .and_then(|content| laravel_string_completion_context(content, position, "config"));
+        let blade_section_context = text
+            .as_deref()
+            .and_then(|content| blade_section_string_completion_context(content, position));
 
         let context_kind = text
             .as_deref()
@@ -709,6 +737,25 @@ impl LanguageServer for Backend {
             }
         }
 
+        if is_blade_template && blade_section_context.is_some() {
+            for section_name in collect_blade_section_names(&docs_snapshot) {
+                if (!prefix.is_empty() && !section_name.to_lowercase().starts_with(&prefix))
+                    || !seen.insert(section_name.clone())
+                {
+                    continue;
+                }
+
+                let item = CompletionItem {
+                    label: section_name,
+                    kind: Some(CompletionItemKind::VALUE),
+                    detail: Some("Blade section".to_string()),
+                    ..CompletionItem::default()
+                };
+                let score = completion_score(&item.label, &prefix, false, item.kind, context_kind) + 24;
+                scored_items.push((score, item));
+            }
+        }
+
         let index = self.symbols.read().await;
         if let (Some(content), Some(class_name)) = (text.as_deref(), static_context.as_deref()) {
             let mut queries = resolve_symbol_queries(content, position, class_name);
@@ -848,6 +895,8 @@ impl LanguageServer for Backend {
                         };
 
                         if let Some(target_text) = target_text {
+                            let mut instance_member_seen = HashSet::new();
+
                             for member in collect_class_member_entries(&target_text, class_symbol) {
                                 if member.is_static {
                                     continue;
@@ -860,10 +909,11 @@ impl LanguageServer for Backend {
                                     .map(|raw| apply_template_substitution(raw, &template_mapping));
                                 let lowercase = label.to_lowercase();
                                 if (!prefix.is_empty() && !lowercase.starts_with(&prefix))
-                                    || !seen.insert(label.clone())
+                                    || !instance_member_seen.insert(label.clone())
                                 {
                                     continue;
                                 }
+                                seen.insert(label.clone());
 
                                 let item = CompletionItem {
                                     label: label.clone(),
@@ -882,6 +932,92 @@ impl LanguageServer for Backend {
                                 };
                                 let score = completion_score(&item.label, &prefix, *target_uri == uri, item.kind, context_kind) + 12;
                                 scored_items.push((score, item));
+                            }
+
+                            let mixin_types = get_nearby_docblock_for_line(
+                                &target_text,
+                                class_symbol.range.start.line as usize,
+                            )
+                            .map(|doc| extract_mixin_types_from_docblock(&doc))
+                            .unwrap_or_default();
+                            let mut seen_mixins = HashSet::new();
+
+                            for mixin in mixin_types {
+                                let mixin_key = mixin.trim_start_matches('\\').to_ascii_lowercase();
+                                if mixin_key.is_empty() || !seen_mixins.insert(mixin_key) {
+                                    continue;
+                                }
+
+                                let mut mixin_queries = resolve_symbol_queries(
+                                    &target_text,
+                                    class_symbol.range.start,
+                                    &mixin,
+                                );
+                                if !mixin_queries.iter().any(|q| q == &mixin) {
+                                    mixin_queries.push(mixin.clone());
+                                }
+
+                                let Some((mixin_uri, mixin_symbol)) =
+                                    find_symbol_location_for_queries(target_uri, &index, &mixin_queries)
+                                else {
+                                    continue;
+                                };
+                                if !is_type_symbol_kind(mixin_symbol.kind) {
+                                    continue;
+                                }
+
+                                let mixin_text = if *mixin_uri == *target_uri {
+                                    Some(target_text.clone())
+                                } else if *mixin_uri == uri {
+                                    Some(content.to_string())
+                                } else {
+                                    let docs = self.documents.read().await;
+                                    docs.get(mixin_uri).cloned()
+                                };
+
+                                if let Some(mixin_text) = mixin_text {
+                                    for member in collect_class_member_entries(&mixin_text, mixin_symbol) {
+                                        if member.is_static {
+                                            continue;
+                                        }
+                                        let label = member.label;
+                                        let kind = member.kind;
+                                        let member_type = member.type_hint;
+                                        let lowercase = label.to_lowercase();
+                                        if (!prefix.is_empty() && !lowercase.starts_with(&prefix))
+                                            || !instance_member_seen.insert(label.clone())
+                                        {
+                                            continue;
+                                        }
+                                        seen.insert(label.clone());
+
+                                        let item = CompletionItem {
+                                            label: label.clone(),
+                                            kind: Some(kind),
+                                            detail: Some(match member_type.as_deref() {
+                                                Some(type_name) => {
+                                                    format!("Instance member (mixin): {}", type_name)
+                                                }
+                                                None => "Instance member (mixin)".to_string(),
+                                            }),
+                                            data: Some(json!({
+                                                "memberOf": mixin_symbol.fqn(),
+                                                "member": label,
+                                                "memberKind": if kind == CompletionItemKind::METHOD { "method" } else { "property" },
+                                                "memberType": member_type
+                                            })),
+                                            ..CompletionItem::default()
+                                        };
+                                        let score = completion_score(
+                                            &item.label,
+                                            &prefix,
+                                            *mixin_uri == uri,
+                                            item.kind,
+                                            context_kind,
+                                        ) + 11;
+                                        scored_items.push((score, item));
+                                    }
+                                }
                             }
                         }
                     }
@@ -919,13 +1055,26 @@ impl LanguageServer for Backend {
                     continue;
                 }
 
-                let item = CompletionItem {
+                let mut item = CompletionItem {
                     label,
                     kind: Some(completion_kind_from_symbol(symbol.kind)),
                     detail: Some("Workspace symbol".to_string()),
                     data: Some(json!(symbol.fqn())),
                     ..CompletionItem::default()
                 };
+
+                if let Some(content) = text.as_deref() {
+                    if let Some((insert_text, import_edit)) =
+                        completion_auto_import_edit_for_symbol(content, symbol, context_kind)
+                    {
+                        item.additional_text_edits = Some(vec![import_edit]);
+                        if let Some(insert_text) = insert_text {
+                            item.insert_text = Some(insert_text);
+                        }
+                        item.detail = Some("Workspace symbol (auto-import)".to_string());
+                    }
+                }
+
                 let score = completion_score(&item.label, &prefix, local, item.kind, context_kind);
                 scored_items.push((score, item));
             }
@@ -1916,6 +2065,7 @@ impl LanguageServer for Backend {
     ) -> LspResult<Option<Vec<TextEdit>>> {
         let uri = params.text_document_position.text_document.uri;
         let line = params.text_document_position.position.line;
+        let ch = &params.ch;
 
         let original_text = {
             let docs = self.documents.read().await;
@@ -1925,6 +2075,14 @@ impl LanguageServer for Backend {
         let Some(original_text) = original_text else {
             return Ok(None);
         };
+
+        // PHPDoc generation on Enter after "/**"
+        if ch == "\n" {
+            if let Some(edits) = generate_phpdoc_on_enter(&original_text, line) {
+                return Ok(Some(edits));
+            }
+            return Ok(Some(Vec::new()));
+        }
 
         let Some(edit) = format_current_line_edit(&original_text, line) else {
             return Ok(Some(Vec::new()));
@@ -2275,6 +2433,40 @@ fn extract_template_params_from_docblock(comment_text: &str) -> Vec<String> {
     }
 
     templates
+}
+
+fn extract_mixin_types_from_docblock(comment_text: &str) -> Vec<String> {
+    let tags = ["@mixin", "@phpstan-mixin", "@psalm-mixin"];
+    let mut mixins = Vec::new();
+    let mut seen = HashSet::new();
+
+    for line in comment_text.lines() {
+        let cleaned = line
+            .trim()
+            .trim_start_matches("/**")
+            .trim_start_matches("/*")
+            .trim_start_matches('*')
+            .trim_end_matches("*/")
+            .trim();
+        for tag in tags {
+            let Some(rest) = cleaned.strip_prefix(tag) else {
+                continue;
+            };
+
+            let Some(raw_type) = parse_type_annotation_prefix(rest.trim_start()) else {
+                continue;
+            };
+            let Some(normalized) = normalize_type_name_for_inference(&raw_type) else {
+                continue;
+            };
+
+            if seen.insert(normalized.clone()) {
+                mixins.push(normalized);
+            }
+        }
+    }
+
+    mixins
 }
 
 fn parse_template_name_prefix(input: &str) -> Option<String> {
@@ -2768,6 +2960,215 @@ fn split_fqn(fqn: &str) -> (Option<String>, String) {
     (None, normalized.to_string())
 }
 
+fn load_diagnostic_filter_config(workspace_roots: &[Url]) -> DiagnosticFilterConfig {
+    let mut merged = DiagnosticFilterConfig::default();
+
+    for root in workspace_roots {
+        let Ok(root_path) = root.to_file_path() else {
+            continue;
+        };
+
+        let config_path = root_path.join(".vscode-ls-php.json");
+        let Ok(text) = fs::read_to_string(config_path) else {
+            continue;
+        };
+
+        let parsed = parse_diagnostic_filter_config_text(&text);
+        merged.disabled_rules.extend(parsed.disabled_rules);
+        for (rule, prefixes) in parsed.disabled_in_paths {
+            merged
+                .disabled_in_paths
+                .entry(rule)
+                .or_default()
+                .extend(prefixes);
+        }
+    }
+
+    merged
+}
+
+fn parse_diagnostic_filter_config_text(text: &str) -> DiagnosticFilterConfig {
+    let mut out = DiagnosticFilterConfig::default();
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return out;
+    };
+
+    let Some(diag) = value.get("diagnostics") else {
+        return out;
+    };
+
+    if let Some(disabled_rules) = diag.get("disableRules").and_then(|v| v.as_array()) {
+        for rule in disabled_rules.iter().filter_map(|v| v.as_str()) {
+            let key = rule.trim().to_ascii_lowercase();
+            if !key.is_empty() {
+                out.disabled_rules.insert(key);
+            }
+        }
+    }
+
+    if let Some(version_text) = diag.get("phpTargetVersion").and_then(|v| v.as_str()) {
+        out.php_target_version = parse_php_target_version(version_text);
+    }
+
+    if let Some(map) = diag.get("disableInPaths").and_then(|v| v.as_object()) {
+        for (rule, prefixes) in map {
+            let rule_key = rule.trim().to_ascii_lowercase();
+            if rule_key.is_empty() {
+                continue;
+            }
+
+            let Some(prefix_array) = prefixes.as_array() else {
+                continue;
+            };
+
+            let normalized_prefixes = prefix_array
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(normalize_directory_rule)
+                .filter(|p| !p.is_empty())
+                .collect::<Vec<_>>();
+            if normalized_prefixes.is_empty() {
+                continue;
+            }
+
+            out.disabled_in_paths
+                .entry(rule_key)
+                .or_default()
+                .extend(normalized_prefixes);
+        }
+    }
+
+    out
+}
+
+fn relative_workspace_path(uri: &Url, workspace_roots: &[Url]) -> Option<String> {
+    let file_path = uri.to_file_path().ok()?;
+    for root in workspace_roots {
+        let Ok(root_path) = root.to_file_path() else {
+            continue;
+        };
+        let Ok(rel) = file_path.strip_prefix(&root_path) else {
+            continue;
+        };
+        let normalized = rel
+            .to_string_lossy()
+            .replace('\\', "/")
+            .trim_start_matches('/')
+            .to_ascii_lowercase();
+        if !normalized.is_empty() {
+            return Some(normalized);
+        }
+    }
+    None
+}
+
+fn normalize_directory_rule(rule: &str) -> String {
+    rule.trim()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .to_ascii_lowercase()
+}
+
+fn parse_php_target_version(version_text: &str) -> Option<(u32, u32)> {
+    let trimmed = version_text.trim();
+    let (maj, min) = trimmed.split_once('.')?;
+    let major = maj.trim().parse::<u32>().ok()?;
+    let minor_digits = min
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if minor_digits.is_empty() {
+        return None;
+    }
+    let minor = minor_digits.parse::<u32>().ok()?;
+    Some((major, minor))
+}
+
+fn path_matches_directory_rule(relative_path: &str, rule: &str) -> bool {
+    let rel = normalize_directory_rule(relative_path);
+    let mut prefix = normalize_directory_rule(rule);
+    if prefix.ends_with("/**") {
+        prefix.truncate(prefix.len().saturating_sub(3));
+    }
+    prefix = prefix.trim_end_matches('/').to_string();
+
+    if rel.is_empty() || prefix.is_empty() {
+        return false;
+    }
+
+    rel == prefix || rel.starts_with(&(prefix + "/"))
+}
+
+fn diagnostic_rule_from_message(message: &str) -> Option<&'static str> {
+    if message.starts_with("PHP file should contain an opening '") {
+        return Some("missing-php-tag");
+    }
+    if message.starts_with("Avoid leaving debug output") {
+        return Some("debug-output");
+    }
+    if message.starts_with("Unexpected closing brace") || message.starts_with("Unclosed opening brace") {
+        return Some("brace-mismatch");
+    }
+    if message.starts_with("Suspicious assignment '=' in conditional expression") {
+        return Some("operator-confusion");
+    }
+    if message.starts_with("Comment task marker:") {
+        return Some("todo-comment");
+    }
+    if message.starts_with("Undefined function:") {
+        return Some("undefined-function");
+    }
+    if message.starts_with("Undefined method:") {
+        return Some("undefined-method");
+    }
+    if message.starts_with("Undefined variable:") {
+        return Some("undefined-variable");
+    }
+    if message.starts_with("Unused variable:") {
+        return Some("unused-variable");
+    }
+    if message.starts_with("Unused import:") {
+        return Some("unused-import");
+    }
+    if message.starts_with("Duplicate import:") {
+        return Some("duplicate-import");
+    }
+    if message.starts_with("Missing return type:") {
+        return Some("missing-return-type");
+    }
+    if message.starts_with("PHP version compatibility:") {
+        return Some("php-version-compatibility");
+    }
+    None
+}
+
+fn is_diagnostic_enabled_for_path(
+    diagnostic: &Diagnostic,
+    relative_path: Option<&str>,
+    config: &DiagnosticFilterConfig,
+) -> bool {
+    let Some(rule) = diagnostic_rule_from_message(&diagnostic.message) else {
+        return true;
+    };
+
+    if config.disabled_rules.contains(rule) {
+        return false;
+    }
+
+    let Some(path) = relative_path else {
+        return true;
+    };
+
+    if let Some(prefixes) = config.disabled_in_paths.get(rule) {
+        if prefixes.iter().any(|prefix| path_matches_directory_rule(path, prefix)) {
+            return false;
+        }
+    }
+
+    true
+}
+
 fn search_terms_for_target_in_document(
     target_fqn: &str,
     doc_text: &str,
@@ -2977,7 +3378,7 @@ fn collect_parameter_hints_for_line(
                                 hints.push((
                                     line,
                                     start as u32,
-                                    format!("{}:", parameter_hint_name(&parameters[arg_index], arg_index)),
+                                    parameter_hint_label(&parameters[arg_index], arg_index),
                                 ));
                             }
                         }
@@ -3007,7 +3408,7 @@ fn collect_parameter_hints_for_line(
                                 hints.push((
                                     line,
                                     start as u32,
-                                    format!("{}:", parameter_hint_name(&parameters[arg_index], arg_index)),
+                                    parameter_hint_label(&parameters[arg_index], arg_index),
                                 ));
                             }
                         }
@@ -3098,6 +3499,42 @@ fn parameter_hint_name(parameter: &str, arg_index: usize) -> String {
         return name.trim_start_matches('$').to_string();
     }
     format!("arg{}", arg_index + 1)
+}
+
+fn parameter_hint_label(parameter: &str, arg_index: usize) -> String {
+    let name = parameter_hint_name(parameter, arg_index);
+    let is_by_ref = parameter_is_by_reference(parameter);
+    let type_hint = parameter_type_hint(parameter);
+
+    match (is_by_ref, type_hint) {
+        (true, Some(ty)) => format!("&{} ({}):", name, ty),
+        (false, Some(ty)) => format!("{} ({}):", name, ty),
+        (true, None) => format!("&{}:", name),
+        (false, None) => format!("{}:", name),
+    }
+}
+
+fn parameter_is_by_reference(parameter: &str) -> bool {
+    let Some(var_name) = extract_first_variable_name(parameter) else {
+        return false;
+    };
+
+    let Some(idx) = parameter.find(&var_name) else {
+        return false;
+    };
+
+    parameter[..idx].contains('&')
+}
+
+fn parameter_type_hint(parameter: &str) -> Option<String> {
+    let var_name = extract_first_variable_name(parameter)?;
+    let idx = parameter.find(&var_name)?;
+    let head = parameter[..idx].trim();
+    let hint = parse_property_type_hint_from_declaration_head(head)?;
+    if hint.eq_ignore_ascii_case("mixed") {
+        return None;
+    }
+    Some(hint)
 }
 
 fn collect_class_implementation_locations(
@@ -4284,6 +4721,52 @@ fn symbol_completion_label(symbol: &PhpSymbol, context: CompletionContextKind) -
     symbol.name.clone()
 }
 
+fn completion_auto_import_edit_for_symbol(
+    doc_text: &str,
+    symbol: &PhpSymbol,
+    context: CompletionContextKind,
+) -> Option<(Option<String>, TextEdit)> {
+    if context != CompletionContextKind::General || !is_type_symbol_kind(symbol.kind) {
+        return None;
+    }
+
+    let fqn = symbol.fqn();
+    let (symbol_ns, short_name) = split_fqn(&fqn);
+    if symbol_ns.is_none() || short_name.is_empty() {
+        return None;
+    }
+
+    let current_ns = first_namespace_in_text(doc_text);
+    if current_ns == symbol_ns {
+        return None;
+    }
+
+    let existing_imports = parse_use_aliases(doc_text);
+    if existing_imports.values().any(|existing| existing == &fqn) {
+        return None;
+    }
+
+    let insertion = find_use_insertion_position(doc_text);
+    let (new_text, _title) = import_action_for_fqn(&fqn, &existing_imports)?;
+    let insert_text = existing_imports
+        .get(&short_name)
+        .and_then(|existing_fqn| {
+            if existing_fqn == &fqn {
+                None
+            } else {
+                Some(unique_import_alias(&short_name, &existing_imports))
+            }
+        });
+
+    Some((
+        insert_text,
+        TextEdit {
+            range: Range::new(insertion, insertion),
+            new_text,
+        },
+    ))
+}
+
 fn format_symbol_for_hover(symbol: &PhpSymbol) -> String {
     format_symbol_for_hover_with_templates(symbol, &[])
 }
@@ -5449,6 +5932,87 @@ fn collect_laravel_route_names(docs: &HashMap<Url, String>) -> Vec<String> {
     out
 }
 
+
+fn collect_blade_section_names(docs: &HashMap<Url, String>) -> Vec<String> {
+    let mut names = HashSet::new();
+    for (uri, text) in docs {
+        if is_blade_uri(uri) || looks_like_blade_template(text) {
+            names.extend(extract_blade_section_names_from_text(text));
+        }
+    }
+    let mut out = names.into_iter().collect::<Vec<_>>();
+    out.sort();
+    out
+}
+
+fn extract_blade_section_names_from_text(text: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        names.extend(extract_blade_directive_names_from_line(trimmed, "@yield"));
+        names.extend(extract_blade_directive_names_from_line(trimmed, "@section"));
+    }
+    names
+}
+
+fn extract_blade_directive_names_from_line(line: &str, directive: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut search_from = 0usize;
+
+    while search_from < line.len() {
+        let Some(idx_rel) = line[search_from..].find(directive) else {
+            break;
+        };
+        let idx = search_from + idx_rel;
+        let after = &line[idx + directive.len()..];
+        let after_trim = after.trim_start();
+        if !after_trim.starts_with('(') {
+            search_from = idx + directive.len();
+            continue;
+        }
+
+        let inner = after_trim[1..].trim_start();
+        let Some(quote) = inner.chars().next() else {
+            search_from = idx + directive.len();
+            continue;
+        };
+        if quote != '\'' && quote != '"' {
+            search_from = idx + directive.len();
+            continue;
+        }
+
+        let tail = &inner[1..];
+        if let Some(end_idx) = tail.find(quote) {
+            let name = tail[..end_idx].trim();
+            if !name.is_empty() {
+                out.insert(name.to_string());
+            }
+        }
+
+        search_from = idx + directive.len();
+    }
+
+    out
+}
+
+fn blade_section_string_completion_context(text: &str, position: Position) -> Option<char> {
+    let line = text.lines().nth(position.line as usize)?;
+    let idx = (position.character as usize).min(line.len());
+    let prefix = &line[..idx];
+
+    for directive in ["@section", "@yield"] {
+        let single = format!("{}('", directive);
+        let double = format!("{}(\"", directive);
+        if prefix.contains(&single) {
+            return Some('\'');
+        }
+        if prefix.contains(&double) {
+            return Some('"');
+        }
+    }
+
+    None
+}
 fn extract_laravel_route_names_from_text(text: &str) -> HashSet<String> {
     let mut names = HashSet::new();
     let mut rest = text;

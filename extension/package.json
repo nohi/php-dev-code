@@ -77,6 +77,16 @@
           "type": "boolean",
           "default": true,
           "description": "Automatically rerun tests on changes under tests/**/*.php when continuous testing is enabled."
+        },
+        "vscodeLsPhp.formatOnSave": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically format PHP/Blade files with the language server formatter on save."
+        },
+        "vscodeLsPhp.formatOnPaste": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically format the pasted range with the language server formatter when pasting into PHP/Blade files."
         }
       }
     }
