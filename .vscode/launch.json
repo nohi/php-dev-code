@@ -1,0 +1,18 @@
+{
+ "version": "0.2.0",
+ "configurations": [
+   {
+     "name": "Run Extension",
+     "type": "extensionHost",
+     "request": "launch",
+     "args": [
+       "--profile-temp",
+       "--extensionDevelopmentPath=${workspaceFolder}\\extension"
+     ],
+     "outFiles": ["${workspaceFolder}/extension/**/*.js"],
+     "preLaunchTask": "npm: build",
+    //  "preLaunchTask": "${defaultBuildTask}",
+     "skipFiles": ["**/app/out/vs/**"]
+   }
+ ]
+}
