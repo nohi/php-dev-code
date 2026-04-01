@@ -33,12 +33,17 @@ VS Code extension project for high-performance PHP language features.
 - Observational run (no threshold enforcement):
    - `npm run bench:server`
 - Gate run (fails on threshold breach):
-   - `npm run bench:gate`
+    - `npm run bench:gate`
+- Gate run with baseline delta review:
+   - `node scripts/lsp-benchmark.js --fail-on-threshold --require-baseline --baseline scripts/benchmark-baseline.json`
 
 Default gate thresholds:
 
 - Completion p95: <= 30 ms
 - Hover p95: <= 20 ms
+- Completion p95 regression vs baseline: <= 5 ms
+- Hover p95 regression vs baseline: <= 5 ms
+- Index duration regression vs baseline: <= 1000 ms
 
 Optional index-duration target:
 
@@ -81,3 +86,14 @@ This repository currently contains the initial scaffold:
    - Profiling dashboard for LSP request latency and recent test-run durations.
 
 The full feature list should be implemented incrementally by milestones documented in `docs/roadmap.md`.
+
+## Formatter Settings
+
+The extension exposes lightweight formatter controls through `vscodeLsPhp.*` settings:
+
+- `vscodeLsPhp.formatStylePreset` (default: `default`)
+  - Allowed values: `default`, `PSR-12`, `PSR-2`, `PER`, `K&R`, `Allman`, `Laravel`, `Drupal`, `WordPress`
+  - Presets currently map to normalization profiles for existing lightweight rules (blank-line compaction, Blade directive spacing, trailing whitespace trimming), not full brace-style reformatting.
+- `vscodeLsPhp.formatMaxBlankLines` (number, default: `2`, minimum: `0`)
+- `vscodeLsPhp.formatBladeDirectiveSpacing` (boolean, default: `true`)
+- `vscodeLsPhp.formatTrimTrailingWhitespace` (boolean, default: `true`)

@@ -1,12 +1,149 @@
 use tower_lsp::lsp_types::{Position, Range, TextEdit};
 
+const ENV_STYLE_PRESET: &str = "VSCODE_LS_PHP_FORMAT_STYLE_PRESET";
+const ENV_MAX_BLANK_LINES: &str = "VSCODE_LS_PHP_FORMAT_MAX_BLANK_LINES";
+const ENV_BLADE_DIRECTIVE_SPACING: &str = "VSCODE_LS_PHP_FORMAT_BLADE_DIRECTIVE_SPACING";
+const ENV_TRIM_TRAILING_WHITESPACE: &str = "VSCODE_LS_PHP_FORMAT_TRIM_TRAILING_WHITESPACE";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FormatStylePreset {
+    Default,
+    Psr12,
+    Psr2,
+    Per,
+    Kr,
+    Allman,
+    Laravel,
+    Drupal,
+    WordPress,
+}
+
+impl FormatStylePreset {
+    fn from_env_value(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "psr-12" => Self::Psr12,
+            "psr-2" => Self::Psr2,
+            "per" => Self::Per,
+            "k&r" => Self::Kr,
+            "allman" => Self::Allman,
+            "laravel" => Self::Laravel,
+            "drupal" => Self::Drupal,
+            "wordpress" => Self::WordPress,
+            _ => Self::Default,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FormatConfig {
+    style_preset: FormatStylePreset,
+    max_blank_lines: usize,
+    blade_directive_spacing: bool,
+    trim_trailing_whitespace: bool,
+}
+
+impl Default for FormatConfig {
+    fn default() -> Self {
+        Self {
+            style_preset: FormatStylePreset::Default,
+            max_blank_lines: 2,
+            blade_directive_spacing: true,
+            trim_trailing_whitespace: true,
+        }
+    }
+}
+
+impl FormatConfig {
+    fn from_env() -> Self {
+        let defaults = Self::default();
+        let style_preset = std::env::var(ENV_STYLE_PRESET)
+            .map(|value| FormatStylePreset::from_env_value(&value))
+            .unwrap_or(defaults.style_preset);
+        let mut config = Self {
+            style_preset,
+            ..defaults
+        }
+        .resolve_preset();
+
+        if let Some(max_blank_lines) = std::env::var(ENV_MAX_BLANK_LINES)
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+        {
+            config.max_blank_lines = max_blank_lines;
+        }
+
+        if let Some(blade_directive_spacing) = std::env::var(ENV_BLADE_DIRECTIVE_SPACING)
+            .ok()
+            .and_then(parse_bool_env)
+        {
+            config.blade_directive_spacing = blade_directive_spacing;
+        }
+
+        if let Some(trim_trailing_whitespace) = std::env::var(ENV_TRIM_TRAILING_WHITESPACE)
+            .ok()
+            .and_then(parse_bool_env)
+        {
+            config.trim_trailing_whitespace = trim_trailing_whitespace;
+        }
+
+        config
+    }
+
+    /// Presets currently map to normalization profiles over lightweight rules.
+    fn resolve_preset(mut self) -> Self {
+        match self.style_preset {
+            FormatStylePreset::Default => {}
+            FormatStylePreset::Laravel | FormatStylePreset::Psr12 | FormatStylePreset::Per => {
+                self.blade_directive_spacing = true;
+                self.trim_trailing_whitespace = true;
+                self.max_blank_lines = 2;
+            }
+            FormatStylePreset::WordPress => {
+                self.max_blank_lines = 1;
+            }
+            FormatStylePreset::Kr
+            | FormatStylePreset::Allman
+            | FormatStylePreset::Psr2
+            | FormatStylePreset::Drupal => {
+                self.trim_trailing_whitespace = true;
+                self.max_blank_lines = 2;
+            }
+        }
+        self
+    }
+}
+
+fn parse_bool_env(raw: String) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 pub(crate) fn format_document(text: &str) -> String {
+    let config = FormatConfig::from_env();
+    let mut out = format_text_internal(text, &config);
+    if out.is_empty() {
+        return out;
+    }
+    out.push('\n');
+    out
+}
+
+fn format_text_internal(text: &str, config: &FormatConfig) -> String {
     let mut normalized_lines = text
         .split('\n')
-        .map(|line| line.trim_end().to_string())
+        .map(|line| {
+            if config.trim_trailing_whitespace {
+                line.trim_end().to_string()
+            } else {
+                line.to_string()
+            }
+        })
         .collect::<Vec<_>>();
 
-    if looks_like_blade_template(text) {
+    if config.blade_directive_spacing && looks_like_blade_template(text) {
         normalized_lines = normalized_lines
             .into_iter()
             .map(|line| format_blade_directive_spacing(&line))
@@ -26,7 +163,7 @@ pub(crate) fn format_document(text: &str) -> String {
     for line in normalized_lines {
         if line.is_empty() {
             consecutive_empty += 1;
-            if consecutive_empty <= 2 {
+            if consecutive_empty <= config.max_blank_lines {
                 compact.push(line);
             }
         } else {
@@ -35,13 +172,7 @@ pub(crate) fn format_document(text: &str) -> String {
         }
     }
 
-    if compact.is_empty() {
-        return String::new();
-    }
-
-    let mut out = compact.join("\n");
-    out.push('\n');
-    out
+    compact.join("\n")
 }
 
 pub(crate) fn document_end_position(text: &str) -> Position {
@@ -122,41 +253,8 @@ pub(crate) fn format_current_line_edit(text: &str, line: u32) -> Option<TextEdit
 }
 
 pub(crate) fn format_range_text(text: &str) -> String {
-    let mut normalized_lines = text
-        .split('\n')
-        .map(|line| line.trim_end().to_string())
-        .collect::<Vec<_>>();
-
-    if looks_like_blade_template(text) {
-        normalized_lines = normalized_lines
-            .into_iter()
-            .map(|line| format_blade_directive_spacing(&line))
-            .collect();
-    }
-
-    while normalized_lines
-        .last()
-        .map(|line| line.is_empty())
-        .unwrap_or(false)
-    {
-        normalized_lines.pop();
-    }
-
-    let mut compact = Vec::new();
-    let mut consecutive_empty = 0usize;
-    for line in normalized_lines {
-        if line.is_empty() {
-            consecutive_empty += 1;
-            if consecutive_empty <= 2 {
-                compact.push(line);
-            }
-        } else {
-            consecutive_empty = 0;
-            compact.push(line);
-        }
-    }
-
-    compact.join("\n")
+    let config = FormatConfig::from_env();
+    format_text_internal(text, &config)
 }
 
 pub(crate) fn format_blade_directive_spacing(line: &str) -> String {

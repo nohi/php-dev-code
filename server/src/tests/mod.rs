@@ -6,7 +6,11 @@ use super::{
         collect_php_files, completion_context_kind, completion_score, extract_local_variables_before_position,
         detect_undefined_variables,
         extract_symbols, find_identifier_ranges, identifier_and_range_at_position,
-        identifier_at_position, is_blade_uri, is_code_position, is_php_uri, is_valid_identifier_name,
+        identifier_and_range_at_position_for_rename,
+        identifier_at_position, is_blade_uri, is_code_position, is_ide_json_uri, is_indexed_uri,
+        is_php_uri, is_phar_uri, is_valid_identifier_name,
+        is_position_within_range,
+        linked_editing_ranges_at_position,
         import_action_for_fqn,
         parse_namespace_declaration, parse_single_use_entry, parse_use_aliases,
         parse_diagnostic_filter_config_text,
@@ -32,9 +36,26 @@ use super::{
         extract_laravel_route_names_from_text,
         extract_php_array_keys,
         extract_blade_section_names_from_text,
+        extract_blade_attributes_from_text,
+        extract_blade_component_names_from_uri,
+        extract_blade_tag_names_from_text,
+        extract_blade_variables_from_text,
+        blade_view_id_from_uri,
+        collect_blade_view_ids,
+        collect_blade_component_attributes,
+        collect_blade_template_variables,
+        BladeTagContext,
         extract_phpstorm_meta_override_function_names,
         laravel_string_completion_context,
         blade_section_string_completion_context,
+        blade_view_string_completion_context,
+        blade_tag_name_completion_context,
+        blade_component_attribute_completion_context,
+        blade_livewire_value_completion_context,
+        blade_variable_completion_context,
+        infer_livewire_component_class_candidates,
+        extract_livewire_public_members_from_class_text,
+        livewire_lifecycle_method_names,
         looks_like_blade_template,
         reference_count_title,
         reference_locations_for_symbol,
@@ -44,6 +65,11 @@ use super::{
         find_use_insertion_position, looks_like_type_name, parse_function_parameters,
         parse_function_return_type,
         php_magic_constants,
+         parse_ide_json_entries,
+         normalize_rename_name_after_prepare,
+         apply_content_changes_to_text,
+         sanitize_text_edits_for_document,
+         insert_sanitized_text_edits,
         symbol_display_name_with_templates,
         extract_class_relationship_targets,
         detect_http_urls,
@@ -96,15 +122,24 @@ use super::{
         CompletionContextKind, NamespaceDeclaration, PhpSymbol, SymbolKind,
     };
     use std::collections::{BTreeMap, HashMap, HashSet};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::path::Path;
     use tokio::sync::RwLock;
     use serde_json::json;
     use tower_lsp::{LanguageServer, LspService};
     use tower_lsp::lsp_types::{
         CodeActionOrCommand, CompletionItem, CompletionItemKind, CompletionParams, Diagnostic, DiagnosticSeverity, InlayHintLabel,
+        HoverParams,
+        InitializeParams,
+        LinkedEditingRangeParams,
+        OneOf,
+        PrepareRenameResponse,
         Position, Range,
+        RenameParams,
+        TextEdit,
+        TextDocumentContentChangeEvent,
         TextDocumentIdentifier, TextDocumentPositionParams,
+        WorkspaceSymbolParams,
         Url,
     };
 
@@ -116,6 +151,54 @@ use super::{
         assert!(symbols.iter().any(|s| s.name == "Demo" && s.kind == SymbolKind::CLASS));
         assert!(symbols.iter().any(|s| s.name == "run_test" && s.kind == SymbolKind::FUNCTION));
         assert!(symbols.iter().any(|s| s.name == "VERSION" && s.kind == SymbolKind::CONSTANT));
+    }
+
+    #[tokio::test]
+    async fn initialize_enables_prepare_rename_capability() {
+        let captured_client = Arc::new(Mutex::new(None));
+        let captured_client_for_service = Arc::clone(&captured_client);
+        let (_service, _socket) = LspService::new(move |client| {
+            *captured_client_for_service
+                .lock()
+                .expect("client mutex") = Some(client.clone());
+            Backend {
+                client,
+                documents: RwLock::new(HashMap::new()),
+                symbols: RwLock::new(HashMap::new()),
+                workspace_folders: RwLock::new(Vec::new()),
+                open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
+            }
+        });
+
+        let client = captured_client
+            .lock()
+            .expect("client mutex")
+            .take()
+            .expect("captured client");
+        let backend = Backend {
+            client,
+            documents: RwLock::new(HashMap::new()),
+            symbols: RwLock::new(HashMap::new()),
+            workspace_folders: RwLock::new(Vec::new()),
+            open_documents: RwLock::new(HashSet::new()),
+            rename_prepare_contexts: RwLock::new(HashMap::new()),
+        };
+
+        let init = backend
+            .initialize(InitializeParams::default())
+            .await
+            .expect("initialize response");
+        let rename_provider = init
+            .capabilities
+            .rename_provider
+            .expect("rename provider capability");
+        match rename_provider {
+            OneOf::Right(options) => {
+                assert_eq!(options.prepare_provider, Some(true));
+            }
+            _ => panic!("expected rename provider options with prepare support"),
+        }
     }
 
     #[test]
@@ -273,6 +356,37 @@ use super::{
     }
 
     #[test]
+    fn prepare_rename_accepts_identifier_end_boundary_cursor() {
+        let source = "<?php\nrun_test();\n";
+        assert!(identifier_and_range_at_position_for_rename(source, Position::new(1, 1)).is_some());
+        assert!(identifier_and_range_at_position_for_rename(source, Position::new(1, 8)).is_some());
+    }
+
+    #[test]
+    fn normalizes_rename_name_when_client_already_applied_linked_editing_suffix() {
+        assert_eq!(
+            normalize_rename_name_after_prepare("$arg", "$argA", "$argAA"),
+            "$argA"
+        );
+        assert_eq!(
+            normalize_rename_name_after_prepare("$arg", "$argA", "$argA"),
+            "$argA"
+        );
+        assert_eq!(
+            normalize_rename_name_after_prepare("$arg", "$arg", "$argA"),
+            "$argA"
+        );
+    }
+
+    #[test]
+    fn range_membership_uses_exclusive_end_position() {
+        let range = Range::new(Position::new(2, 4), Position::new(2, 8));
+        assert!(is_position_within_range(Position::new(2, 4), range));
+        assert!(is_position_within_range(Position::new(2, 7), range));
+        assert!(!is_position_within_range(Position::new(2, 8), range));
+    }
+
+    #[test]
     fn finds_identifier_occurrences_with_boundaries() {
         let source = "<?php\nrun_test();\nrun_test;\nrun_test_extra();";
         let ranges = find_identifier_ranges(source, "run_test");
@@ -291,6 +405,461 @@ use super::{
         let source = "<?php\n$value = 1;\n$value += 2;\n// $value\n$text = \"$value\";";
         let ranges = find_identifier_ranges(source, "$value");
         assert_eq!(ranges.len(), 2);
+    }
+
+    #[test]
+    fn returns_linked_editing_ranges_for_variable_identifier() {
+        let source = "<?php\n$name = 'a';\necho $name;\n$name = strtoupper($name);";
+        let ranges = linked_editing_ranges_at_position(source, Position::new(1, 2));
+        let Some(ranges) = ranges else {
+            panic!("expected linked editing ranges for variable");
+        };
+        assert_eq!(ranges.len(), 4);
+    }
+
+    #[test]
+    fn returns_no_linked_editing_ranges_for_non_variable_or_non_code_position() {
+        let source = "<?php\nrun_test();\n// $name\n$text = \"$name\";\n$name = 1;";
+        assert!(linked_editing_ranges_at_position(source, Position::new(1, 2)).is_none());
+        assert!(linked_editing_ranges_at_position(source, Position::new(2, 4)).is_none());
+        assert!(linked_editing_ranges_at_position(source, Position::new(3, 10)).is_none());
+    }
+
+    #[test]
+    fn returns_no_linked_editing_ranges_for_builtin_or_future_variables() {
+        let with_builtin = "<?php\nfunction run(): void {\n    echo $this;\n    echo $_GET['id'] ?? '';\n}\n";
+        assert!(linked_editing_ranges_at_position(with_builtin, Position::new(2, 10)).is_none());
+        assert!(linked_editing_ranges_at_position(with_builtin, Position::new(3, 10)).is_none());
+
+        let declared_later = "<?php\nfunction run(): void {\n    echo $later;\n    $later = 1;\n}\n";
+        assert!(linked_editing_ranges_at_position(declared_later, Position::new(2, 10)).is_none());
+    }
+
+    #[tokio::test]
+    async fn linked_editing_range_returns_variable_occurrences_for_document() {
+        let captured_client = Arc::new(Mutex::new(None));
+        let captured_client_for_service = Arc::clone(&captured_client);
+        let (_service, _socket) = LspService::new(move |client| {
+            *captured_client_for_service
+                .lock()
+                .expect("client mutex") = Some(client.clone());
+            Backend {
+                client,
+                documents: RwLock::new(HashMap::new()),
+                symbols: RwLock::new(HashMap::new()),
+                workspace_folders: RwLock::new(Vec::new()),
+                open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
+            }
+        });
+
+        let client = captured_client
+            .lock()
+            .expect("client mutex")
+            .take()
+            .expect("captured client");
+        let backend = Backend {
+            client,
+            documents: RwLock::new(HashMap::new()),
+            symbols: RwLock::new(HashMap::new()),
+            workspace_folders: RwLock::new(Vec::new()),
+            open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
+        };
+
+        let uri = Url::parse("file:///tmp/linked-editing.php").expect("uri");
+        backend
+            .update_document(
+                uri.clone(),
+                "<?php\n$name = 1;\necho $name;\n$name += 1;\n".to_string(),
+            )
+            .await;
+
+        let result = backend
+            .linked_editing_range(LinkedEditingRangeParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: Position::new(1, 2),
+                },
+                work_done_progress_params: Default::default(),
+            })
+            .await
+            .expect("linked editing result")
+            .expect("linked editing ranges");
+
+        assert_eq!(result.ranges.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn rename_avoids_double_append_after_linked_editing_document_update() {
+        let captured_client = Arc::new(Mutex::new(None));
+        let captured_client_for_service = Arc::clone(&captured_client);
+        let (_service, _socket) = LspService::new(move |client| {
+            *captured_client_for_service
+                .lock()
+                .expect("client mutex") = Some(client.clone());
+            Backend {
+                client,
+                documents: RwLock::new(HashMap::new()),
+                symbols: RwLock::new(HashMap::new()),
+                workspace_folders: RwLock::new(Vec::new()),
+                open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
+            }
+        });
+
+        let client = captured_client
+            .lock()
+            .expect("client mutex")
+            .take()
+            .expect("captured client");
+        let backend = Backend {
+            client,
+            documents: RwLock::new(HashMap::new()),
+            symbols: RwLock::new(HashMap::new()),
+            workspace_folders: RwLock::new(Vec::new()),
+            open_documents: RwLock::new(HashSet::new()),
+            rename_prepare_contexts: RwLock::new(HashMap::new()),
+        };
+
+        let uri = Url::parse("file:///tmp/rename-linked-editing.php").expect("uri");
+        backend
+            .update_document(
+                uri.clone(),
+                "<?php\nfunction demo($arg) {\n    return $arg;\n}\n".to_string(),
+            )
+            .await;
+
+        let prepare = backend
+            .prepare_rename(TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position::new(1, 16),
+            })
+            .await
+            .expect("prepare rename result")
+            .expect("prepare rename response");
+        let prepared_range = match prepare {
+            PrepareRenameResponse::RangeWithPlaceholder { range, .. } => range,
+            PrepareRenameResponse::Range(range) => range,
+            PrepareRenameResponse::DefaultBehavior { default_behavior: _ } => {
+                panic!("expected explicit prepare rename range")
+            }
+        };
+        assert_eq!(prepared_range.start, Position::new(1, 14));
+        assert_eq!(prepared_range.end, Position::new(1, 18));
+
+        backend
+            .update_document(
+                uri.clone(),
+                "<?php\nfunction demo($argA) {\n    return $argA;\n}\n".to_string(),
+            )
+            .await;
+
+        let edit = backend
+            .rename(RenameParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: Position::new(1, 17),
+                },
+                new_name: "$argAA".to_string(),
+                work_done_progress_params: Default::default(),
+            })
+            .await
+            .expect("rename result")
+            .expect("workspace edit");
+
+        assert!(edit.changes.is_none());
+        assert!(edit.document_changes.is_none());
+    }
+
+    #[tokio::test]
+    async fn prepare_rename_rejects_parenthesis_position() {
+        let captured_client = Arc::new(Mutex::new(None));
+        let captured_client_for_service = Arc::clone(&captured_client);
+        let (_service, _socket) = LspService::new(move |client| {
+            *captured_client_for_service
+                .lock()
+                .expect("client mutex") = Some(client.clone());
+            Backend {
+                client,
+                documents: RwLock::new(HashMap::new()),
+                symbols: RwLock::new(HashMap::new()),
+                workspace_folders: RwLock::new(Vec::new()),
+                open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
+            }
+        });
+
+        let client = captured_client
+            .lock()
+            .expect("client mutex")
+            .take()
+            .expect("captured client");
+        let backend = Backend {
+            client,
+            documents: RwLock::new(HashMap::new()),
+            symbols: RwLock::new(HashMap::new()),
+            workspace_folders: RwLock::new(Vec::new()),
+            open_documents: RwLock::new(HashSet::new()),
+            rename_prepare_contexts: RwLock::new(HashMap::new()),
+        };
+
+        let uri = Url::parse("file:///tmp/prepare-rename-invalid.php").expect("uri");
+        backend
+            .update_document(uri.clone(), "<?php\nrun_test();\n".to_string())
+            .await;
+
+        let result = backend
+            .prepare_rename(TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position: Position::new(1, 9),
+            })
+            .await
+            .expect("prepare rename result");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn rename_at_identifier_end_boundary_generates_edits() {
+        let captured_client = Arc::new(Mutex::new(None));
+        let captured_client_for_service = Arc::clone(&captured_client);
+        let (_service, _socket) = LspService::new(move |client| {
+            *captured_client_for_service
+                .lock()
+                .expect("client mutex") = Some(client.clone());
+            Backend {
+                client,
+                documents: RwLock::new(HashMap::new()),
+                symbols: RwLock::new(HashMap::new()),
+                workspace_folders: RwLock::new(Vec::new()),
+                open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
+            }
+        });
+
+        let client = captured_client
+            .lock()
+            .expect("client mutex")
+            .take()
+            .expect("captured client");
+        let backend = Backend {
+            client,
+            documents: RwLock::new(HashMap::new()),
+            symbols: RwLock::new(HashMap::new()),
+            workspace_folders: RwLock::new(Vec::new()),
+            open_documents: RwLock::new(HashSet::new()),
+            rename_prepare_contexts: RwLock::new(HashMap::new()),
+        };
+
+        let uri = Url::parse("file:///tmp/rename-method-boundary.php").expect("uri");
+        backend
+            .update_document(
+                uri.clone(),
+                "<?php\nclass C {\n    public function registertesttest() {}\n    public function boot(): void {\n        $this->registertesttest();\n    }\n}\n"
+                    .to_string(),
+            )
+            .await;
+
+        let prepare = backend
+            .prepare_rename(TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position::new(2, 36),
+            })
+            .await
+            .expect("prepare rename result");
+        let Some(PrepareRenameResponse::RangeWithPlaceholder { placeholder, .. }) = prepare else {
+            panic!("expected prepare rename placeholder")
+        };
+        assert_eq!(placeholder, "registertesttest");
+
+        let edit = backend
+            .rename(RenameParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: Position::new(2, 36),
+                },
+                new_name: "registertesttestA".to_string(),
+                work_done_progress_params: Default::default(),
+            })
+            .await
+            .expect("rename result")
+            .expect("workspace edit");
+
+        let changes = edit.changes.expect("changes map");
+        let edits = changes.get(&uri).expect("document edits");
+        assert!(!edits.is_empty(), "rename at identifier end should produce edits");
+        assert!(
+            edits.iter().all(|e| e.new_text == "registertesttestA"),
+            "rename should apply requested name on boundary cursor"
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_boundary_normalizes_duplicate_append_from_linked_editing_update() {
+        let captured_client = Arc::new(Mutex::new(None));
+        let captured_client_for_service = Arc::clone(&captured_client);
+        let (_service, _socket) = LspService::new(move |client| {
+            *captured_client_for_service
+                .lock()
+                .expect("client mutex") = Some(client.clone());
+            Backend {
+                client,
+                documents: RwLock::new(HashMap::new()),
+                symbols: RwLock::new(HashMap::new()),
+                workspace_folders: RwLock::new(Vec::new()),
+                open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
+            }
+        });
+
+        let client = captured_client
+            .lock()
+            .expect("client mutex")
+            .take()
+            .expect("captured client");
+        let backend = Backend {
+            client,
+            documents: RwLock::new(HashMap::new()),
+            symbols: RwLock::new(HashMap::new()),
+            workspace_folders: RwLock::new(Vec::new()),
+            open_documents: RwLock::new(HashSet::new()),
+            rename_prepare_contexts: RwLock::new(HashMap::new()),
+        };
+
+        let uri = Url::parse("file:///tmp/rename-method-boundary-linked.php").expect("uri");
+        backend
+            .update_document(
+                uri.clone(),
+                "<?php\nclass C {\n    public function registertesttest() {}\n    public function boot(): void {\n        $this->registertesttest();\n    }\n}\n"
+                    .to_string(),
+            )
+            .await;
+
+        let _prepare = backend
+            .prepare_rename(TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position::new(2, 36),
+            })
+            .await
+            .expect("prepare rename result")
+            .expect("prepare rename response");
+
+        backend
+            .update_document(
+                uri.clone(),
+                "<?php\nclass C {\n    public function registertesttestA() {}\n    public function boot(): void {\n        $this->registertesttestA();\n    }\n}\n"
+                    .to_string(),
+            )
+            .await;
+
+        let edit = backend
+            .rename(RenameParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: Position::new(2, 37),
+                },
+                new_name: "registertesttestAA".to_string(),
+                work_done_progress_params: Default::default(),
+            })
+            .await
+            .expect("rename result")
+            .expect("workspace edit");
+        assert!(edit.changes.is_none(), "normalized duplicate append should become no-op");
+        assert!(edit.document_changes.is_none());
+    }
+
+    #[test]
+    fn normalizes_rename_name_for_method_linked_editing_suffix() {
+        assert_eq!(
+            normalize_rename_name_after_prepare(
+                "registertesttest",
+                "registertesttestA",
+                "registertesttestAA"
+            ),
+            "registertesttestA"
+        );
+    }
+
+    #[test]
+    fn sanitize_text_edits_removes_invalid_and_overlapping_and_sorts_descending() {
+        let text = "<?php\n$abc = 1;\n$abc = $abc + 1;\n";
+        let edits = vec![
+            TextEdit {
+                range: Range::new(Position::new(1, 0), Position::new(1, 4)),
+                new_text: "$name".to_string(),
+            },
+            TextEdit {
+                range: Range::new(Position::new(1, 0), Position::new(1, 2)),
+                new_text: "$n".to_string(),
+            },
+            TextEdit {
+                range: Range::new(Position::new(2, 7), Position::new(2, 11)),
+                new_text: "$name".to_string(),
+            },
+            TextEdit {
+                range: Range::new(Position::new(2, 30), Position::new(2, 35)),
+                new_text: "$bad".to_string(),
+            },
+        ];
+
+        let sanitized = sanitize_text_edits_for_document(text, edits);
+        assert_eq!(sanitized.len(), 2);
+        assert_eq!(sanitized[0].range, Range::new(Position::new(2, 7), Position::new(2, 11)));
+        assert_eq!(sanitized[1].range, Range::new(Position::new(1, 0), Position::new(1, 4)));
+    }
+
+    #[test]
+    fn insert_sanitized_text_edits_skips_empty_sanitized_results() {
+        let uri = Url::parse("file:///tmp/rename-empty-edits.php").expect("uri");
+        let text = "<?php\n$value = 1;\n";
+        let invalid_only = vec![TextEdit {
+            range: Range::new(Position::new(5, 0), Position::new(5, 5)),
+            new_text: "$renamed".to_string(),
+        }];
+
+        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+        insert_sanitized_text_edits(&mut changes, uri, text, invalid_only);
+
+        assert!(changes.is_empty(), "documents with no valid edits must not be inserted");
+    }
+
+    #[test]
+    fn sanitize_text_edits_accepts_utf16_boundary_positions() {
+        let text = "<?php\n$emoji = \"👋\";\n$emoji = \"x\";\n";
+        let edits = vec![TextEdit {
+            range: Range::new(Position::new(2, 0), Position::new(2, 6)),
+            new_text: "$wave".to_string(),
+        }];
+
+        let sanitized = sanitize_text_edits_for_document(text, edits);
+        assert_eq!(sanitized.len(), 1, "valid UTF-16 boundary edit should be preserved");
+        assert_eq!(sanitized[0].range, Range::new(Position::new(2, 0), Position::new(2, 6)));
+    }
+
+    #[test]
+    fn apply_content_changes_uses_incremental_range_edits() {
+        let original = "<?php\n$arg\n";
+        let changes = vec![TextDocumentContentChangeEvent {
+            range: Some(Range::new(Position::new(1, 4), Position::new(1, 4))),
+            range_length: None,
+            text: "A".to_string(),
+        }];
+
+        let updated = apply_content_changes_to_text(original, &changes).expect("incremental update");
+        assert_eq!(updated, "<?php\n$argA\n");
+    }
+
+    #[test]
+    fn apply_content_changes_respects_utf16_positions() {
+        let original = "👋x\n";
+        let changes = vec![TextDocumentContentChangeEvent {
+            range: Some(Range::new(Position::new(0, 2), Position::new(0, 3))),
+            range_length: None,
+            text: "y".to_string(),
+        }];
+
+        let updated = apply_content_changes_to_text(original, &changes).expect("utf16 update");
+        assert_eq!(updated, "👋y\n");
     }
 
     #[test]
@@ -341,11 +910,161 @@ use super::{
     fn detects_php_uri_by_extension() {
         let php = Url::parse("file:///tmp/test.php").expect("url");
         let blade = Url::parse("file:///tmp/index.blade.php").expect("url");
+        let ide = Url::parse("file:///tmp/ide.json").expect("url");
+        let phar_scheme_php = Url::parse("phar:///tmp/app.phar/src/Test.php").expect("url");
+        let phar_scheme_blade = Url::parse("phar:///tmp/app.phar/resources/index.blade.php").expect("url");
+        let file_phar_segment_php = Url::parse("file:///tmp/vendor/app.phar/src/Test.php").expect("url");
+        let non_file_phar_like_php = Url::parse("zip:///tmp/vendor/app.phar/src/Test.php").expect("url");
+        let non_file_phar_like_text = Url::parse("zip:///tmp/vendor/app.phar/docs/readme.txt").expect("url");
         let txt = Url::parse("file:///tmp/test.txt").expect("url");
         assert!(is_php_uri(&php));
         assert!(is_php_uri(&blade));
+        assert!(is_php_uri(&phar_scheme_php));
+        assert!(is_php_uri(&phar_scheme_blade));
+        assert!(is_php_uri(&file_phar_segment_php));
+        assert!(is_php_uri(&non_file_phar_like_php));
+        assert!(is_phar_uri(&phar_scheme_php));
+        assert!(is_phar_uri(&file_phar_segment_php));
+        assert!(!is_phar_uri(&non_file_phar_like_php));
+        assert!(!is_phar_uri(&non_file_phar_like_text));
+        assert!(!is_php_uri(&non_file_phar_like_text));
         assert!(is_blade_uri(&blade));
+        assert!(is_ide_json_uri(&ide));
+        assert!(is_indexed_uri(&php));
+        assert!(is_indexed_uri(&phar_scheme_php));
+        assert!(is_indexed_uri(&ide));
         assert!(!is_php_uri(&txt));
+        assert!(!is_phar_uri(&txt));
+        assert!(!is_indexed_uri(&txt));
+    }
+
+    #[tokio::test]
+    async fn phar_document_is_indexed_for_hover_and_workspace_symbol() {
+        let captured_client = Arc::new(Mutex::new(None));
+        let captured_client_for_service = Arc::clone(&captured_client);
+        let (_service, _socket) = LspService::new(move |client| {
+            *captured_client_for_service
+                .lock()
+                .expect("client mutex") = Some(client.clone());
+            Backend {
+                client,
+                documents: RwLock::new(HashMap::new()),
+                symbols: RwLock::new(HashMap::new()),
+                workspace_folders: RwLock::new(Vec::new()),
+                open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
+            }
+        });
+
+        let client = captured_client
+            .lock()
+            .expect("client mutex")
+            .take()
+            .expect("captured client");
+        let backend = Backend {
+            client,
+            documents: RwLock::new(HashMap::new()),
+            symbols: RwLock::new(HashMap::new()),
+            workspace_folders: RwLock::new(Vec::new()),
+            open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
+        };
+
+        let uri = Url::parse("phar:///tmp/vendor/tools.phar/src/ArchiveClass.php").expect("uri");
+        backend
+            .update_document(
+                uri.clone(),
+                "<?php\nclass ArchiveClass {}\nnew ArchiveClass();\n".to_string(),
+            )
+            .await;
+
+        let hover = backend
+            .hover(HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: Position::new(2, 5),
+                },
+                work_done_progress_params: Default::default(),
+            })
+            .await
+            .expect("hover result");
+        assert!(hover.is_some());
+
+        let symbols = backend
+            .symbol(WorkspaceSymbolParams {
+                query: "ArchiveClass".to_string(),
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await
+            .expect("workspace symbols")
+            .unwrap_or_default();
+        assert!(symbols
+            .iter()
+            .any(|item| item.name == "ArchiveClass" && item.location.uri == uri));
+    }
+
+    #[test]
+    fn parses_ide_json_entries_from_common_shapes() {
+        let parsed = parse_ide_json_entries(
+            r#"{
+  "completions": [" customWord ", "", "anotherWord"],
+  "blade": {
+    "directives": {"customDirective": {}, "@already": {}},
+    "components": ["profile-card", "x-alert", " badge "]
+  }
+}"#,
+        );
+        assert!(parsed.completions.contains(&"customWord".to_string()));
+        assert!(parsed.completions.contains(&"anotherWord".to_string()));
+        assert!(parsed.blade_directives.contains(&"@customDirective".to_string()));
+        assert!(parsed.blade_directives.contains(&"@already".to_string()));
+        assert!(parsed.blade_components.contains(&"profile-card".to_string()));
+        assert!(parsed.blade_components.contains(&"x-profile-card".to_string()));
+        assert!(parsed.blade_components.contains(&"x-alert".to_string()));
+        assert!(parsed.blade_components.contains(&"badge".to_string()));
+        assert!(parsed.blade_components.contains(&"x-badge".to_string()));
+    }
+
+    #[test]
+    fn parses_ide_json_entries_returns_empty_on_invalid_json() {
+        let parsed = parse_ide_json_entries("{invalid-json");
+        assert!(parsed.completions.is_empty());
+        assert!(parsed.blade_directives.is_empty());
+        assert!(parsed.blade_components.is_empty());
+    }
+
+    #[test]
+    fn parses_ide_json_entries_from_object_maps_and_dedupes() {
+        let parsed = parse_ide_json_entries(
+            r#"{
+  "completions": {"tenantScope": {}, " tenantScope ": {}, "": {}, " secondWord ": {}},
+  "blade": {
+    "directives": ["tenant", " @tenant ", "", "@already"],
+    "components": {"profile-card": {}, " x-profile-card ": {}, "": {}, "x-alert": {}}
+  }
+}"#,
+        );
+
+        assert!(parsed.completions.contains(&"tenantScope".to_string()));
+        assert!(parsed.completions.contains(&"secondWord".to_string()));
+        assert!(!parsed.completions.iter().any(|item| item.is_empty()));
+
+        assert!(parsed.blade_directives.contains(&"@tenant".to_string()));
+        assert!(parsed.blade_directives.contains(&"@already".to_string()));
+        assert_eq!(
+            parsed
+                .blade_directives
+                .iter()
+                .filter(|item| item.as_str() == "@tenant")
+                .count(),
+            1
+        );
+
+        assert!(parsed.blade_components.contains(&"profile-card".to_string()));
+        assert!(parsed.blade_components.contains(&"x-profile-card".to_string()));
+        assert!(parsed.blade_components.contains(&"x-alert".to_string()));
+        assert!(!parsed.blade_components.iter().any(|item| item.is_empty()));
     }
 
     #[test]
@@ -386,6 +1105,176 @@ use super::{
         let source2 = "@yield(\"header\")\n";
         let yield_ctx = blade_section_string_completion_context(source2, Position::new(0, 11));
         assert_eq!(yield_ctx, Some('"'));
+    }
+
+    #[test]
+    fn detects_blade_view_string_completion_context() {
+        let source = "@include('partials.he')\n";
+        let include_ctx = blade_view_string_completion_context(source, Position::new(0, 16));
+        assert_eq!(include_ctx, Some('\''));
+
+        let source2 = "<?php\nview(\"pages.ho\");\n";
+        let view_ctx = blade_view_string_completion_context(source2, Position::new(1, 13));
+        assert_eq!(view_ctx, Some('"'));
+    }
+
+    #[test]
+    fn derives_blade_view_id_from_uri() {
+        let uri = Url::parse("file:///tmp/resources/views/admin/users/index.blade.php").expect("uri");
+        assert_eq!(
+            blade_view_id_from_uri(&uri).as_deref(),
+            Some("admin.users.index")
+        );
+    }
+
+    #[test]
+    fn collects_blade_view_ids_from_docs_snapshot() {
+        let mut docs = HashMap::new();
+        docs.insert(
+            Url::parse("file:///tmp/resources/views/welcome.blade.php").expect("welcome uri"),
+            "<h1>Welcome</h1>".to_string(),
+        );
+        docs.insert(
+            Url::parse("file:///tmp/resources/views/admin/users/index.blade.php").expect("admin uri"),
+            "<h1>Users</h1>".to_string(),
+        );
+        docs.insert(
+            Url::parse("file:///tmp/app/Services/Helper.php").expect("php uri"),
+            "<?php".to_string(),
+        );
+
+        let ids = collect_blade_view_ids(&docs);
+        assert!(ids.contains(&"welcome".to_string()));
+        assert!(ids.contains(&"admin.users.index".to_string()));
+        assert_eq!(ids.len(), 2);
+    }
+
+    #[test]
+    fn detects_blade_tag_and_attribute_contexts() {
+        let x_tag = "<x-alerts.error";
+        assert_eq!(
+            blade_tag_name_completion_context(x_tag, Position::new(0, 15)),
+            Some(BladeTagContext::X)
+        );
+        let lw_tag = "<livewire:posts-ta";
+        assert_eq!(
+            blade_tag_name_completion_context(lw_tag, Position::new(0, 18)),
+            Some(BladeTagContext::Livewire)
+        );
+
+        let x_attr = "<x-alerts.error cla";
+        assert_eq!(
+            blade_component_attribute_completion_context(x_attr, Position::new(0, 18)),
+            Some(BladeTagContext::X)
+        );
+        let lw_attr = "<livewire:posts-table wire:m";
+        assert_eq!(
+            blade_component_attribute_completion_context(lw_attr, Position::new(0, 29)),
+            Some(BladeTagContext::Livewire)
+        );
+    }
+
+    #[test]
+    fn detects_blade_livewire_value_contexts() {
+        let click = "<livewire:posts-table wire:click=\"ref\" />";
+        let click_ctx = blade_livewire_value_completion_context(click, Position::new(0, 37))
+            .expect("wire:click context");
+        assert_eq!(click_ctx.tag, "posts-table");
+        assert!(matches!(click_ctx.kind, super::LivewireValueKind::Action));
+
+        let model = "<livewire:posts-table wire:model='sea' />";
+        let model_ctx = blade_livewire_value_completion_context(model, Position::new(0, 36))
+            .expect("wire:model context");
+        assert_eq!(model_ctx.tag, "posts-table");
+        assert!(matches!(model_ctx.kind, super::LivewireValueKind::Property));
+    }
+
+    #[test]
+    fn infers_livewire_component_class_candidates_from_tag() {
+        let candidates = infer_livewire_component_class_candidates("posts-table");
+        assert!(candidates.contains(&"PostsTable".to_string()));
+        assert!(candidates.contains(&"App\\Livewire\\PostsTable".to_string()));
+        assert!(candidates.contains(&"App\\Http\\Livewire\\PostsTable".to_string()));
+
+        let nested = infer_livewire_component_class_candidates("admin.posts-table");
+        assert!(nested.contains(&"PostsTable".to_string()));
+        assert!(nested.contains(&"App\\Livewire\\Admin\\PostsTable".to_string()));
+        assert!(nested.contains(&"App\\Http\\Livewire\\Admin\\PostsTable".to_string()));
+    }
+
+    #[test]
+    fn extracts_livewire_public_actions_and_properties() {
+        let source = "<?php\nclass PostsTable extends Component {\n    public string $search = '';\n    protected string $hidden = '';\n    public static string $global = '';\n    public function render() {}\n    public function mount() {}\n    public function updatingSearch() {}\n    public function updatedSearch() {}\n    public function refresh() {}\n    public function archivePost(int $id) {}\n    protected function hiddenAction() {}\n    private function secretAction() {}\n    public function __invoke() {}\n}\n";
+        let lifecycle = livewire_lifecycle_method_names();
+        let extracted = extract_livewire_public_members_from_class_text(source, &lifecycle);
+        assert!(extracted.actions.contains("refresh"));
+        assert!(extracted.actions.contains("archivePost"));
+        assert!(!extracted.actions.contains("render"));
+        assert!(!extracted.actions.contains("mount"));
+        assert!(!extracted.actions.contains("updatingSearch"));
+        assert!(!extracted.actions.contains("updatedSearch"));
+        assert!(!extracted.actions.contains("__invoke"));
+        assert!(!extracted.actions.contains("hiddenAction"));
+        assert!(extracted.properties.contains("search"));
+        assert!(!extracted.properties.contains("hidden"));
+        assert!(!extracted.properties.contains("global"));
+    }
+
+    #[test]
+    fn extracts_blade_component_names_tags_and_attributes() {
+        let uri = Url::parse("file:///tmp/resources/views/components/alerts/error.blade.php")
+            .expect("component uri");
+        let names = extract_blade_component_names_from_uri(&uri);
+        assert!(names.contains("alerts.error"));
+
+        let text = "<x-alerts.error class=\"x\" :theme=\"$theme\" />\n<livewire:posts-table wire:model=\"search\" wire:click=\"refresh\" />";
+        let x_tags = extract_blade_tag_names_from_text(text, BladeTagContext::X);
+        let lw_tags = extract_blade_tag_names_from_text(text, BladeTagContext::Livewire);
+        assert!(x_tags.contains("alerts.error"));
+        assert!(lw_tags.contains("posts-table"));
+
+        let x_attrs = extract_blade_attributes_from_text(text, BladeTagContext::X);
+        let lw_attrs = extract_blade_attributes_from_text(text, BladeTagContext::Livewire);
+        assert!(x_attrs.contains("class"));
+        assert!(x_attrs.contains(":theme"));
+        assert!(lw_attrs.contains("wire:model"));
+        assert!(lw_attrs.contains("wire:click"));
+    }
+
+    #[test]
+    fn collects_blade_attributes_and_variables_from_snapshot() {
+        let mut docs = HashMap::new();
+        docs.insert(
+            Url::parse("file:///tmp/page.blade.php").expect("blade uri"),
+            "<x-alert class=\"mb-2\" :title=\"$title\" id=\"alert-1\" />\n<livewire:posts-table wire:model=\"search\" wire:click=\"refresh\" />\n{{ $title }} {{ $slot }}".to_string(),
+        );
+
+        let x_attrs = collect_blade_component_attributes(&docs, BladeTagContext::X);
+        let lw_attrs = collect_blade_component_attributes(&docs, BladeTagContext::Livewire);
+        assert!(x_attrs.contains(&"class".to_string()));
+        assert!(x_attrs.contains(&":title".to_string()));
+        assert!(lw_attrs.contains(&"wire:model".to_string()));
+        assert!(lw_attrs.contains(&"wire:click".to_string()));
+
+        let vars = collect_blade_template_variables(&docs);
+        assert!(vars.contains(&"$slot".to_string()));
+        assert!(vars.contains(&"$attributes".to_string()));
+        assert!(vars.contains(&"$title".to_string()));
+    }
+
+    #[test]
+    fn detects_blade_variable_completion_context() {
+        let source = "{{ $tit }}";
+        let ctx = blade_variable_completion_context(source, Position::new(0, 7));
+        assert_eq!(ctx, Some(()));
+    }
+
+    #[test]
+    fn extracts_blade_variables_from_text() {
+        let vars = extract_blade_variables_from_text("{{ $slot }} {{ $attributes }} {{ $userName }}");
+        assert!(vars.contains("$slot"));
+        assert!(vars.contains("$attributes"));
+        assert!(vars.contains("$userName"));
     }
 
     #[test]
@@ -1191,6 +2080,7 @@ use super::{
                 symbols: RwLock::new(HashMap::new()),
                 workspace_folders: RwLock::new(Vec::new()),
                 open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
             }
         });
 
@@ -1205,6 +2095,7 @@ use super::{
             symbols: RwLock::new(HashMap::new()),
             workspace_folders: RwLock::new(Vec::new()),
             open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
         };
 
         let uri = Url::parse("file:///tmp/member-type-generic.php").expect("uri");
@@ -1280,6 +2171,7 @@ $repo->fi
                 symbols: RwLock::new(HashMap::new()),
                 workspace_folders: RwLock::new(Vec::new()),
                 open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
             }
         });
 
@@ -1294,6 +2186,7 @@ $repo->fi
             symbols: RwLock::new(HashMap::new()),
             workspace_folders: RwLock::new(Vec::new()),
             open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
         };
 
         let uri = Url::parse("file:///tmp/mixin-completion.php").expect("uri");
@@ -1372,6 +2265,7 @@ $repo->fr
                 symbols: RwLock::new(HashMap::new()),
                 workspace_folders: RwLock::new(Vec::new()),
                 open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
             }
         });
 
@@ -1386,6 +2280,7 @@ $repo->fr
             symbols: RwLock::new(HashMap::new()),
             workspace_folders: RwLock::new(Vec::new()),
             open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
         };
 
         let current_uri = Url::parse("file:///tmp/auto-import-current.php").expect("current uri");
@@ -1466,6 +2361,7 @@ class User {}
                 symbols: RwLock::new(HashMap::new()),
                 workspace_folders: RwLock::new(Vec::new()),
                 open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
             }
         });
 
@@ -1480,6 +2376,7 @@ class User {}
             symbols: RwLock::new(HashMap::new()),
             workspace_folders: RwLock::new(Vec::new()),
             open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
         };
 
         let shared_uri = Url::parse("file:///tmp/layout.blade.php").expect("shared uri");
@@ -1518,6 +2415,661 @@ class User {}
             .find(|item| item.label == "content")
             .expect("content section completion");
         assert_eq!(content_item.detail.as_deref(), Some("Blade section"));
+    }
+
+    #[tokio::test]
+    async fn completion_response_suggests_blade_section_names_with_dot_prefix() {
+        let captured_client = Arc::new(Mutex::new(None));
+        let captured_client_for_service = Arc::clone(&captured_client);
+        let (_service, _socket) = LspService::new(move |client| {
+            *captured_client_for_service
+                .lock()
+                .expect("client mutex") = Some(client.clone());
+            Backend {
+                client,
+                documents: RwLock::new(HashMap::new()),
+                symbols: RwLock::new(HashMap::new()),
+                workspace_folders: RwLock::new(Vec::new()),
+                open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
+            }
+        });
+
+        let client = captured_client
+            .lock()
+            .expect("client mutex")
+            .take()
+            .expect("captured client");
+        let backend = Backend {
+            client,
+            documents: RwLock::new(HashMap::new()),
+            symbols: RwLock::new(HashMap::new()),
+            workspace_folders: RwLock::new(Vec::new()),
+            open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
+        };
+
+        let shared_uri = Url::parse("file:///tmp/layout.blade.php").expect("shared uri");
+        let shared_source = "@yield('layout.content')\n";
+        backend
+            .update_document(shared_uri, shared_source.to_string())
+            .await;
+
+        let current_uri = Url::parse("file:///tmp/page.blade.php").expect("current uri");
+        let current_source = "@extends('layout')\n@section('layout.co')\n";
+        backend
+            .update_document(current_uri.clone(), current_source.to_string())
+            .await;
+
+        let response = backend
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: current_uri.clone() },
+                    position: Position::new(1, 19),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .expect("completion result")
+            .expect("completion response");
+
+        let items = match response {
+            tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
+            tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
+        };
+
+        let content_item = items
+            .iter()
+            .find(|item| item.label == "layout.content")
+            .expect("layout.content section completion");
+        assert_eq!(content_item.detail.as_deref(), Some("Blade section"));
+    }
+
+    #[tokio::test]
+    async fn completion_response_suggests_blade_view_ids_in_include_and_view_calls() {
+        let captured_client = Arc::new(Mutex::new(None));
+        let captured_client_for_service = Arc::clone(&captured_client);
+        let (_service, _socket) = LspService::new(move |client| {
+            *captured_client_for_service
+                .lock()
+                .expect("client mutex") = Some(client.clone());
+            Backend {
+                client,
+                documents: RwLock::new(HashMap::new()),
+                symbols: RwLock::new(HashMap::new()),
+                workspace_folders: RwLock::new(Vec::new()),
+                open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
+            }
+        });
+
+        let client = captured_client
+            .lock()
+            .expect("client mutex")
+            .take()
+            .expect("captured client");
+        let backend = Backend {
+            client,
+            documents: RwLock::new(HashMap::new()),
+            symbols: RwLock::new(HashMap::new()),
+            workspace_folders: RwLock::new(Vec::new()),
+            open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
+        };
+
+        backend
+            .update_document(
+                Url::parse("file:///tmp/resources/views/admin/users/index.blade.php")
+                    .expect("view uri"),
+                "<h1>Users</h1>".to_string(),
+            )
+            .await;
+        backend
+            .update_document(
+                Url::parse("file:///tmp/resources/views/layouts/app.blade.php").expect("layout uri"),
+                "<h1>Layout</h1>".to_string(),
+            )
+            .await;
+
+        let include_uri = Url::parse("file:///tmp/resources/views/page.blade.php").expect("include uri");
+        backend
+            .update_document(include_uri.clone(), "@include('admin.u')\n".to_string())
+            .await;
+
+        let include_response = backend
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: include_uri.clone(),
+                    },
+                    position: Position::new(0, 17),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .expect("include completion result")
+            .expect("include completion response");
+
+        let include_items = match include_response {
+            tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
+            tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
+        };
+        let include_item = include_items
+            .iter()
+            .find(|item| item.label == "admin.users.index")
+            .expect("blade view completion for include");
+        assert_eq!(include_item.detail.as_deref(), Some("Blade view"));
+
+        let php_uri = Url::parse("file:///tmp/controller.php").expect("php uri");
+        backend
+            .update_document(php_uri.clone(), "<?php\nview('layouts.ap');\n".to_string())
+            .await;
+        let php_response = backend
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: php_uri.clone() },
+                    position: Position::new(1, 16),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .expect("php view completion result")
+            .expect("php view completion response");
+        let php_items = match php_response {
+            tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
+            tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
+        };
+        assert!(php_items
+            .iter()
+            .any(|item| item.label == "layouts.app" && item.detail.as_deref() == Some("Blade view")));
+    }
+
+    #[tokio::test]
+    async fn completion_response_suggests_x_and_livewire_tags_and_attributes() {
+        let captured_client = Arc::new(Mutex::new(None));
+        let captured_client_for_service = Arc::clone(&captured_client);
+        let (_service, _socket) = LspService::new(move |client| {
+            *captured_client_for_service
+                .lock()
+                .expect("client mutex") = Some(client.clone());
+            Backend {
+                client,
+                documents: RwLock::new(HashMap::new()),
+                symbols: RwLock::new(HashMap::new()),
+                workspace_folders: RwLock::new(Vec::new()),
+                open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
+            }
+        });
+
+        let client = captured_client
+            .lock()
+            .expect("client mutex")
+            .take()
+            .expect("captured client");
+        let backend = Backend {
+            client,
+            documents: RwLock::new(HashMap::new()),
+            symbols: RwLock::new(HashMap::new()),
+            workspace_folders: RwLock::new(Vec::new()),
+            open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
+        };
+
+        backend
+            .update_document(
+                Url::parse("file:///tmp/resources/views/components/alerts/error.blade.php")
+                    .expect("component uri"),
+                "<div>{{ $slot }}</div>".to_string(),
+            )
+            .await;
+        backend
+            .update_document(
+                Url::parse("file:///tmp/resources/views/observed.blade.php").expect("observed uri"),
+                "<livewire:posts-table wire:model=\"search\" wire:click=\"refresh\" />\n<x-alerts.error class=\"mb-2\" :theme=\"$theme\" />".to_string(),
+            )
+            .await;
+
+        let tag_uri = Url::parse("file:///tmp/resources/views/current.blade.php").expect("tag uri");
+        backend
+            .update_document(tag_uri.clone(), "<x-ale\n".to_string())
+            .await;
+
+        let x_tag_response = backend
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: tag_uri.clone() },
+                    position: Position::new(0, 6),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .expect("x-tag completion result")
+            .expect("x-tag completion response");
+        let x_tag_items = match x_tag_response {
+            tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
+            tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
+        };
+        let x_item = x_tag_items
+            .iter()
+            .find(|item| item.label == "x-alerts.error")
+            .expect("x-tag completion");
+        assert_eq!(x_item.detail.as_deref(), Some("Blade component tag"));
+
+        backend
+            .update_document(tag_uri.clone(), "<livewire:posts-\n".to_string())
+            .await;
+        let livewire_response = backend
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: tag_uri.clone() },
+                    position: Position::new(0, 16),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .expect("livewire completion result")
+            .expect("livewire completion response");
+        let livewire_items = match livewire_response {
+            tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
+            tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
+        };
+        let lw_item = livewire_items
+            .iter()
+            .find(|item| item.label == "livewire:posts-table")
+            .expect("livewire tag completion");
+        assert_eq!(lw_item.detail.as_deref(), Some("Livewire component"));
+
+        backend
+            .update_document(tag_uri.clone(), "<x-alerts.error :t\n".to_string())
+            .await;
+        let x_attr_response = backend
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: tag_uri.clone() },
+                    position: Position::new(0, 17),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .expect("x-attr completion result")
+            .expect("x-attr completion response");
+        let x_attr_items = match x_attr_response {
+            tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
+            tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
+        };
+        assert!(x_attr_items
+            .iter()
+            .any(|item| item.label == ":theme" && item.detail.as_deref() == Some("Blade attribute")));
+
+        backend
+            .update_document(tag_uri.clone(), "<livewire:posts-table wire:\n".to_string())
+            .await;
+        let lw_attr_response = backend
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: tag_uri.clone() },
+                    position: Position::new(0, 27),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .expect("livewire attr completion result")
+            .expect("livewire attr completion response");
+        let lw_attr_items = match lw_attr_response {
+            tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
+            tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
+        };
+        assert!(lw_attr_items
+            .iter()
+            .any(|item| item.label == "wire:model" && item.detail.as_deref() == Some("Blade attribute")));
+    }
+
+    #[tokio::test]
+    async fn completion_response_suggests_livewire_actions_and_properties_in_wire_values() {
+        let captured_client = Arc::new(Mutex::new(None));
+        let captured_client_for_service = Arc::clone(&captured_client);
+        let (_service, _socket) = LspService::new(move |client| {
+            *captured_client_for_service
+                .lock()
+                .expect("client mutex") = Some(client.clone());
+            Backend {
+                client,
+                documents: RwLock::new(HashMap::new()),
+                symbols: RwLock::new(HashMap::new()),
+                workspace_folders: RwLock::new(Vec::new()),
+                open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
+            }
+        });
+
+        let client = captured_client
+            .lock()
+            .expect("client mutex")
+            .take()
+            .expect("captured client");
+        let backend = Backend {
+            client,
+            documents: RwLock::new(HashMap::new()),
+            symbols: RwLock::new(HashMap::new()),
+            workspace_folders: RwLock::new(Vec::new()),
+            open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
+        };
+
+        backend
+            .update_document(
+                Url::parse("file:///tmp/app/Livewire/PostsTable.php").expect("livewire class uri"),
+                "<?php\nnamespace App\\Livewire;\n\nclass PostsTable extends Component\n{\n    public string $search = '';\n    protected string $hidden = '';\n\n    public function mount() {}\n    public function refresh() {}\n    public function archivePost(int $id) {}\n}\n".to_string(),
+            )
+            .await;
+        backend
+            .update_document(
+                Url::parse("file:///tmp/app/Services/PostsTable.php").expect("non livewire class uri"),
+                "<?php\nnamespace App\\Services;\n\nclass PostsTable\n{\n    public function serviceOnlyAction() {}\n    public string $serviceOnlyState = '';\n}\n".to_string(),
+            )
+            .await;
+
+        let blade_uri = Url::parse("file:///tmp/resources/views/current.blade.php").expect("blade uri");
+        backend
+            .update_document(
+                blade_uri.clone(),
+                "<livewire:posts-table wire:click=\"\" wire:model=\"\" />".to_string(),
+            )
+            .await;
+
+        let click_response = backend
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: blade_uri.clone(),
+                    },
+                    position: Position::new(0, 34),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .expect("click completion result")
+            .expect("click completion response");
+        let click_items = match click_response {
+            tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
+            tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
+        };
+        assert!(click_items
+            .iter()
+            .any(|item| item.label == "refresh" && item.detail.as_deref() == Some("Livewire action")));
+        assert!(click_items
+            .iter()
+            .any(|item| item.label == "archivePost" && item.detail.as_deref() == Some("Livewire action")));
+        assert!(!click_items
+            .iter()
+            .any(|item| item.label == "mount" && item.detail.as_deref() == Some("Livewire action")));
+        assert!(!click_items.iter().any(|item| item.label == "serviceOnlyAction"));
+
+        let model_response = backend
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: blade_uri },
+                    position: Position::new(0, 48),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .expect("model completion result")
+            .expect("model completion response");
+        let model_items = match model_response {
+            tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
+            tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
+        };
+        assert!(model_items
+            .iter()
+            .any(|item| item.label == "search" && item.detail.as_deref() == Some("Livewire property")));
+        assert!(!model_items
+            .iter()
+            .any(|item| item.label == "hidden" && item.detail.as_deref() == Some("Livewire property")));
+        assert!(!model_items.iter().any(|item| item.label == "serviceOnlyState"));
+    }
+
+    #[tokio::test]
+    async fn completion_response_suggests_blade_component_variables() {
+        let captured_client = Arc::new(Mutex::new(None));
+        let captured_client_for_service = Arc::clone(&captured_client);
+        let (_service, _socket) = LspService::new(move |client| {
+            *captured_client_for_service
+                .lock()
+                .expect("client mutex") = Some(client.clone());
+            Backend {
+                client,
+                documents: RwLock::new(HashMap::new()),
+                symbols: RwLock::new(HashMap::new()),
+                workspace_folders: RwLock::new(Vec::new()),
+                open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
+            }
+        });
+
+        let client = captured_client
+            .lock()
+            .expect("client mutex")
+            .take()
+            .expect("captured client");
+        let backend = Backend {
+            client,
+            documents: RwLock::new(HashMap::new()),
+            symbols: RwLock::new(HashMap::new()),
+            workspace_folders: RwLock::new(Vec::new()),
+            open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
+        };
+
+        backend
+            .update_document(
+                Url::parse("file:///tmp/resources/views/shared.blade.php").expect("shared uri"),
+                "{{ $pageTitle }} {{ $attributes }}".to_string(),
+            )
+            .await;
+        let current_uri = Url::parse("file:///tmp/resources/views/page.blade.php").expect("current uri");
+        backend
+            .update_document(current_uri.clone(), "{{ $at }}".to_string())
+            .await;
+
+        let response = backend
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: current_uri.clone(),
+                    },
+                    position: Position::new(0, 6),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .expect("blade variable completion result")
+            .expect("blade variable completion response");
+        let items = match response {
+            tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
+            tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
+        };
+
+        let attributes = items
+            .iter()
+            .find(|item| item.label == "$attributes")
+            .expect("$attributes completion");
+        assert_eq!(attributes.detail.as_deref(), Some("Blade variable"));
+    }
+
+    #[tokio::test]
+    async fn completion_response_includes_ide_json_custom_entries_for_blade() {
+        let captured_client = Arc::new(Mutex::new(None));
+        let captured_client_for_service = Arc::clone(&captured_client);
+        let (_service, _socket) = LspService::new(move |client| {
+            *captured_client_for_service
+                .lock()
+                .expect("client mutex") = Some(client.clone());
+            Backend {
+                client,
+                documents: RwLock::new(HashMap::new()),
+                symbols: RwLock::new(HashMap::new()),
+                workspace_folders: RwLock::new(Vec::new()),
+                open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
+            }
+        });
+
+        let client = captured_client
+            .lock()
+            .expect("client mutex")
+            .take()
+            .expect("captured client");
+        let backend = Backend {
+            client,
+            documents: RwLock::new(HashMap::new()),
+            symbols: RwLock::new(HashMap::new()),
+            workspace_folders: RwLock::new(Vec::new()),
+            open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
+        };
+
+        let ide_uri = Url::parse("file:///tmp/ide.json").expect("ide uri");
+        let ide_source = r#"{
+  "completions": ["tenantScope"],
+  "blade": {
+    "directives": ["tenant"],
+    "components": {"alert": {}, "x-banner": {}}
+  }
+}"#;
+        backend
+            .update_document(ide_uri, ide_source.to_string())
+            .await;
+
+        let blade_uri = Url::parse("file:///tmp/page.blade.php").expect("blade uri");
+        backend
+            .update_document(blade_uri.clone(), "@".to_string())
+            .await;
+
+        let response = backend
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: blade_uri.clone() },
+                    position: Position::new(0, 1),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .expect("completion result")
+            .expect("completion response");
+
+        let items = match response {
+            tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
+            tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
+        };
+
+        assert!(items.iter().any(|item| item.label == "tenantScope"));
+        let directive = items
+            .iter()
+            .find(|item| item.label == "@tenant")
+            .expect("custom blade directive completion");
+        assert_eq!(directive.detail.as_deref(), Some("Laravel ide.json directive"));
+        let component = items
+            .iter()
+            .find(|item| item.label == "x-alert")
+            .expect("custom blade component completion");
+        assert_eq!(component.detail.as_deref(), Some("Laravel ide.json component"));
+    }
+
+    #[tokio::test]
+    async fn completion_response_excludes_blade_only_ide_json_entries_for_php_context() {
+        let captured_client = Arc::new(Mutex::new(None));
+        let captured_client_for_service = Arc::clone(&captured_client);
+        let (_service, _socket) = LspService::new(move |client| {
+            *captured_client_for_service
+                .lock()
+                .expect("client mutex") = Some(client.clone());
+            Backend {
+                client,
+                documents: RwLock::new(HashMap::new()),
+                symbols: RwLock::new(HashMap::new()),
+                workspace_folders: RwLock::new(Vec::new()),
+                open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
+            }
+        });
+
+        let client = captured_client
+            .lock()
+            .expect("client mutex")
+            .take()
+            .expect("captured client");
+        let backend = Backend {
+            client,
+            documents: RwLock::new(HashMap::new()),
+            symbols: RwLock::new(HashMap::new()),
+            workspace_folders: RwLock::new(Vec::new()),
+            open_documents: RwLock::new(HashSet::new()),
+                rename_prepare_contexts: RwLock::new(HashMap::new()),
+        };
+
+        let ide_uri = Url::parse("file:///tmp/ide.json").expect("ide uri");
+        let ide_source = r#"{
+  "completions": ["tenantScope"],
+  "blade": {
+    "directives": ["tenant"],
+    "components": {"alert": {}, "x-banner": {}}
+  }
+}"#;
+        backend
+            .update_document(ide_uri, ide_source.to_string())
+            .await;
+
+        let php_uri = Url::parse("file:///tmp/page.php").expect("php uri");
+        backend
+            .update_document(php_uri.clone(), "<?php\nten".to_string())
+            .await;
+
+        let response = backend
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: php_uri.clone() },
+                    position: Position::new(1, 3),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .expect("completion result")
+            .expect("completion response");
+
+        let items = match response {
+            tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
+            tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
+        };
+
+        assert!(items.iter().any(|item| item.label == "tenantScope"));
+        assert!(!items.iter().any(|item| item.label == "@tenant"));
+        assert!(!items.iter().any(|item| item.label == "x-alert"));
     }
 
     #[test]
@@ -3110,6 +4662,103 @@ class User {}
         assert_eq!(output, "<?php\n\n\necho 'x';\n");
     }
 
+    fn formatter_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn with_formatter_env_vars(vars: &[(&str, Option<&str>)], test: impl FnOnce()) {
+        let _guard = formatter_env_lock().lock().expect("formatter env lock");
+        let previous = vars
+            .iter()
+            .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
+            .collect::<Vec<_>>();
+
+        for (key, value) in vars {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+
+        test();
+
+        for (key, value) in previous {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
+    fn format_document_wordpress_preset_limits_blank_lines_to_one() {
+        with_formatter_env_vars(
+            &[
+                ("VSCODE_LS_PHP_FORMAT_STYLE_PRESET", Some("WordPress")),
+                ("VSCODE_LS_PHP_FORMAT_MAX_BLANK_LINES", None),
+                ("VSCODE_LS_PHP_FORMAT_BLADE_DIRECTIVE_SPACING", None),
+                ("VSCODE_LS_PHP_FORMAT_TRIM_TRAILING_WHITESPACE", None),
+            ],
+            || {
+                let input = "<?php\necho 'a';\n\n\n\necho 'b';\n";
+                let output = format_document(input);
+                assert_eq!(output, "<?php\necho 'a';\n\necho 'b';\n");
+            },
+        );
+    }
+
+    #[test]
+    fn format_document_uses_custom_max_blank_lines_and_blade_spacing_toggle() {
+        with_formatter_env_vars(
+            &[
+                ("VSCODE_LS_PHP_FORMAT_STYLE_PRESET", Some("default")),
+                ("VSCODE_LS_PHP_FORMAT_MAX_BLANK_LINES", Some("0")),
+                ("VSCODE_LS_PHP_FORMAT_BLADE_DIRECTIVE_SPACING", Some("false")),
+                ("VSCODE_LS_PHP_FORMAT_TRIM_TRAILING_WHITESPACE", Some("true")),
+            ],
+            || {
+                let input = "@if($ok)\n\n\n\n@endif\n";
+                let output = format_document(input);
+                assert_eq!(output, "@if($ok)\n@endif\n");
+            },
+        );
+    }
+
+    #[test]
+    fn format_document_custom_max_blank_lines_overrides_wordpress_preset() {
+        with_formatter_env_vars(
+            &[
+                ("VSCODE_LS_PHP_FORMAT_STYLE_PRESET", Some("WordPress")),
+                ("VSCODE_LS_PHP_FORMAT_MAX_BLANK_LINES", Some("3")),
+                ("VSCODE_LS_PHP_FORMAT_BLADE_DIRECTIVE_SPACING", None),
+                ("VSCODE_LS_PHP_FORMAT_TRIM_TRAILING_WHITESPACE", None),
+            ],
+            || {
+                let input = "<?php\necho 'a';\n\n\n\n\necho 'b';\n";
+                let output = format_document(input);
+                assert_eq!(output, "<?php\necho 'a';\n\n\n\necho 'b';\n");
+            },
+        );
+    }
+
+    #[test]
+    fn format_document_respects_trim_trailing_whitespace_toggle() {
+        with_formatter_env_vars(
+            &[
+                ("VSCODE_LS_PHP_FORMAT_STYLE_PRESET", Some("default")),
+                ("VSCODE_LS_PHP_FORMAT_MAX_BLANK_LINES", None),
+                ("VSCODE_LS_PHP_FORMAT_BLADE_DIRECTIVE_SPACING", None),
+                ("VSCODE_LS_PHP_FORMAT_TRIM_TRAILING_WHITESPACE", Some("false")),
+            ],
+            || {
+                let input = "<?php\necho 'x';   \n";
+                let output = format_document(input);
+                assert_eq!(output, "<?php\necho 'x';   \n");
+            },
+        );
+    }
+
     #[test]
     fn builds_var_dump_delete_action_for_debug_diagnostic() {
         let text = "<?php\nvar_dump($x);\n$y = 1;\n";
@@ -3835,3 +5484,4 @@ fn builds_range_formatting_edit_for_selected_lines() {
         assert_eq!(hints[0].2, "left:");
         assert_eq!(hints[1].2, "right:");
     }
+

@@ -12,7 +12,9 @@
   ],
   "activationEvents": [
     "onLanguage:php",
-    "onLanguage:blade"
+    "onLanguage:blade",
+    "onLanguage:json",
+    "onLanguage:jsonc"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -26,8 +28,40 @@
         "title": "VSCode LS PHP: Launch Xdebug Session"
       },
       {
+        "command": "vscode-ls-php.editDebugExpressionValue",
+        "title": "VSCode LS PHP: Edit Debug Expression Value"
+      },
+      {
+        "command": "vscode-ls-php.addDebugWatchExpression",
+        "title": "VSCode LS PHP: Add Debug Watch Expression"
+      },
+      {
+        "command": "vscode-ls-php.startMultiSessionDebug",
+        "title": "VSCode LS PHP: Start Multi-Session Debug"
+      },
+      {
+        "command": "vscode-ls-php.stopMultiSessionDebug",
+        "title": "VSCode LS PHP: Stop Multi-Session Debug"
+      },
+      {
+        "command": "vscode-ls-php.startLaravelDevServer",
+        "title": "VSCode LS PHP: Start Laravel Dev Server"
+      },
+      {
+        "command": "vscode-ls-php.stopLaravelDevServer",
+        "title": "VSCode LS PHP: Stop Laravel Dev Server"
+      },
+      {
         "command": "vscode-ls-php.writeXdebugTemplate",
         "title": "VSCode LS PHP: Write Xdebug Template"
+      },
+      {
+        "command": "vscode-ls-php.writeDbgpProxyTemplate",
+        "title": "VSCode LS PHP: Write DBGp Proxy Template"
+      },
+      {
+        "command": "vscode-ls-php.inspectXdebugProfiles",
+        "title": "VSCode LS PHP: Inspect Xdebug Profiles"
       },
       {
         "command": "vscode-ls-php.refreshTests",
@@ -48,6 +82,10 @@
       {
         "command": "vscode-ls-php.resetProfilingMetrics",
         "title": "VSCode LS PHP: Reset Profiling Metrics"
+      },
+      {
+        "command": "vscode-ls-php.batchFormatWorkspace",
+        "title": "VSCode LS PHP: Batch Format Workspace"
       }
     ],
     "configuration": {
@@ -62,6 +100,81 @@
           "type": "string",
           "default": "php",
           "description": "PHP executable used for PHPUnit/Pest/Artisan test runs."
+        },
+        "vscodeLsPhp.debugAutoStartServer": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically start PHP built-in web server before launching Xdebug."
+        },
+        "vscodeLsPhp.debugServerHost": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "description": "Host interface used for the auto-started debug PHP web server."
+        },
+        "vscodeLsPhp.debugServerPort": {
+          "type": "number",
+          "default": 8000,
+          "description": "Port used for the auto-started debug PHP web server."
+        },
+        "vscodeLsPhp.debugServerDocroot": {
+          "type": "string",
+          "default": "public",
+          "description": "Document root (relative to workspace) used by the auto-started debug PHP web server."
+        },
+        "vscodeLsPhp.laravelDevServerEnabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Use Laravel dev server assistance for debug workflow."
+        },
+        "vscodeLsPhp.laravelDevServerHost": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "description": "Host interface used by Laravel dev server assistance."
+        },
+        "vscodeLsPhp.laravelDevServerPort": {
+          "type": "number",
+          "default": 8000,
+          "description": "Port used by Laravel dev server assistance."
+        },
+        "vscodeLsPhp.laravelDevServerCommand": {
+          "type": "string",
+          "default": "artisan serve",
+          "description": "Command used to run the Laravel dev server; --host and --port are appended when missing."
+        },
+        "vscodeLsPhp.enableCompoundLaunchTemplates": {
+          "type": "boolean",
+          "default": true,
+          "description": "Generate VSCode LS PHP compound launch templates and a container mapping debug profile in launch.json."
+        },
+        "vscodeLsPhp.xdebugUseDbgpProxy": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable DBGp proxy guidance in generated Xdebug templates and launch metadata."
+        },
+        "vscodeLsPhp.xdebugProxyHost": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "description": "DBGp proxy host used in generated template guidance and launch metadata."
+        },
+        "vscodeLsPhp.xdebugProxyPort": {
+          "type": "number",
+          "default": 9001,
+          "description": "DBGp proxy port used in generated template guidance and launch metadata."
+        },
+        "vscodeLsPhp.xdebugIdeKey": {
+          "type": "string",
+          "default": "VSCODE",
+          "description": "IDE key written to xdebug.ini and used for DBGp proxy guidance."
+        },
+        "vscodeLsPhp.xdebugProfilePath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional absolute or workspace-relative path where Xdebug profile files are stored."
+        },
+        "vscodeLsPhp.xdebugProfileGlob": {
+          "type": "string",
+          "default": "cachegrind.out.*",
+          "description": "Glob pattern used to discover Xdebug profile files."
         },
         "vscodeLsPhp.phpunitBinary": {
           "type": "string",
@@ -78,6 +191,16 @@
           "default": true,
           "description": "Automatically rerun tests on changes under tests/**/*.php when continuous testing is enabled."
         },
+        "vscodeLsPhp.testPreTask": {
+          "type": "string",
+          "default": "",
+          "description": "Optional shell command to run once before a test run starts."
+        },
+        "vscodeLsPhp.testPostTask": {
+          "type": "string",
+          "default": "",
+          "description": "Optional shell command to run once after a test run ends."
+        },
         "vscodeLsPhp.formatOnSave": {
           "type": "boolean",
           "default": false,
@@ -87,6 +210,48 @@
           "type": "boolean",
           "default": false,
           "description": "Automatically format the pasted range with the language server formatter when pasting into PHP/Blade files."
+        },
+        "vscodeLsPhp.formatStylePreset": {
+          "type": "string",
+          "enum": [
+            "default",
+            "PSR-12",
+            "PSR-2",
+            "PER",
+            "K&R",
+            "Allman",
+            "Laravel",
+            "Drupal",
+            "WordPress"
+          ],
+          "default": "default",
+          "description": "Formatting normalization profile preset (currently maps to lightweight whitespace/directive rules)."
+        },
+        "vscodeLsPhp.formatMaxBlankLines": {
+          "type": "number",
+          "default": 2,
+          "minimum": 0,
+          "description": "Maximum consecutive blank lines retained by the formatter."
+        },
+        "vscodeLsPhp.formatBladeDirectiveSpacing": {
+          "type": "boolean",
+          "default": true,
+          "description": "Normalize Blade directive spacing (e.g. @if( to @if ()."
+        },
+        "vscodeLsPhp.formatTrimTrailingWhitespace": {
+          "type": "boolean",
+          "default": true,
+          "description": "Trim trailing whitespace from formatted lines."
+        },
+        "vscodeLsPhp.enableLocalWholeLineSuggestions": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable local-only whole-line inline suggestions for PHP and Blade."
+        },
+        "vscodeLsPhp.localWholeLineMinPrefixLength": {
+          "type": "number",
+          "default": 3,
+          "description": "Minimum non-whitespace prefix length before local whole-line suggestions appear."
         }
       }
     }

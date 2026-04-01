@@ -8,6 +8,7 @@ async function main() {
   let extensionsDir;
   let cacheDir;
   try {
+    process.env.VSCODE_LS_PHP_TEST = "1";
     const extensionDevelopmentPath = path.resolve(__dirname, "..");
     const extensionTestsPath = path.resolve(__dirname, "./suite/index");
     const workspacePath = path.resolve(extensionDevelopmentPath, "..", "sample-php-project");

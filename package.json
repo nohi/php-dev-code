@@ -7,6 +7,7 @@
     "build:extension": "npm --prefix extension run compile",
     "build:server": "cargo build --manifest-path server/Cargo.toml",
     "bench:server": "node scripts/lsp-benchmark.js",
-    "bench:gate": "node scripts/lsp-benchmark.js --fail-on-threshold --max-completion-p95-ms 30 --max-hover-p95-ms 20"
+    "bench:gate": "node scripts/lsp-benchmark.js --fail-on-threshold --require-baseline --baseline scripts/benchmark-baseline.json --max-completion-p95-ms 30 --max-hover-p95-ms 20 --max-completion-p95-regression-ms 5 --max-hover-p95-regression-ms 5 --max-index-regression-ms 1000",
+    "test:bench": "node --test scripts/lsp-benchmark.test.js"
   }
 }

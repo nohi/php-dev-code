@@ -22,9 +22,9 @@
 - [-] [Medium] Go to Implementations expansion for traits and overridden functions.
 - [x] [Medium] PHPDoc generator on `/**` trigger with keyword completion.
 - [-] [Low] Rich localized hover/tooltips (localized descriptions, styled headers, doc URLs).
-- [ ] [Low] PHAR content navigation and symbol/index integration.
-- [ ] [Low] Linked editing for local variable rename-in-place workflows.
-- [ ] [Low] Local AI whole-line suggestions integration.
+- [x] [Low] PHAR content navigation and symbol/index integration.
+- [x] [Low] Linked editing for local variable rename-in-place workflows.
+- [x] [Low] Local AI whole-line suggestions integration.
 
 ## Phase 3: Smart Analysis (4-8 weeks)
 
@@ -53,18 +53,18 @@
 
 ### Phase 4 Reallocated Backlog (Status + Priority)
 
-- [ ] [High] Blade completion expansion for view/component IDs, `x-` tags, `livewire:` tags, attributes, and component variables.
-- [ ] [High] Livewire component analysis/completion support (actions/properties).
-- [ ] [Medium] Blade section completion between `@yield` and `@section`.
-- [ ] [Medium] Laravel `ide.json` support for custom completions/directives/components.
+- [x] [High] Blade completion expansion for view/component IDs, `x-` tags, `livewire:` tags, attributes, and component variables.
+- [x] [High] Livewire component analysis/completion support (actions/properties).
+- [x] [Medium] Blade section completion between `@yield` and `@section`.
+- [x] [Medium] Laravel `ide.json` support for custom completions/directives/components.
 - [-] [Medium] Rich Laravel model/query/view/config/path tooltips with detailed metadata.
-- [ ] [Medium] Composer ecosystem integration (`composer.json` IntelliSense/diagnostics/actions).
+- [x] [Medium] Composer ecosystem integration (`composer.json` IntelliSense/diagnostics/actions).
 - [-] [Medium] Full PSR-12 formatter compliance mode.
 - [x] [Medium] Format-on-paste / format-on-type / format-on-save behavior controls.
-- [ ] [Medium] Laravel built-in dev server assisted run/debug workflow.
-- [ ] [Low] Multiple style presets (`PER`, `PSR-12`, `PSR-2`, `Allman`, `K&R`, `Laravel`, `Drupal`, `WordPress`).
-- [ ] [Low] Custom formatting rule configuration.
-- [ ] [Low] Workspace batch formatting for multiple `.php` files with preview.
+- [x] [Medium] Laravel built-in dev server assisted run/debug workflow.
+- [x] [Low] Multiple style presets (`PER`, `PSR-12`, `PSR-2`, `Allman`, `K&R`, `Laravel`, `Drupal`, `WordPress`).
+- [x] [Low] Custom formatting rule configuration.
+- [x] [Low] Workspace batch formatting for multiple `.php` files with preview.
 
 ## Phase 5: Tooling (3-6 weeks)
 
@@ -74,23 +74,23 @@
 
 ### Phase 5 Reallocated Backlog (Status + Priority)
 
-- [ ] [High] Built-in web server auto-start as part of debug launch.
-- [ ] [Medium] Debug adornments (inline value display) in editor.
-- [ ] [Medium] DBGp Proxy support.
-- [ ] [Medium] Multi-session debugging orchestration.
-- [ ] [Medium] Compound launch templates for multi-server startup.
+- [x] [High] Built-in web server auto-start as part of debug launch.
+- [x] [Medium] Debug adornments (inline value display) in editor.
+- [x] [Medium] DBGp Proxy support.
+- [x] [Medium] Multi-session debugging orchestration.
+- [x] [Medium] Compound launch templates for multi-server startup.
 - [-] [Medium] Remote server debugging presets with path mappings.
-- [ ] [Low] Debug value editing and watch tooltip enhancements.
-- [ ] [Low] Xdebug profile file inspection workflow integration.
-- [ ] [Medium] Pest High-Order Tests intelligence and analysis support.
+- [x] [Low] Debug value editing and watch tooltip enhancements.
+- [x] [Low] Xdebug profile file inspection workflow integration.
+- [x] [Medium] Pest High-Order Tests intelligence and analysis support.
 - [-] [Medium] PHPUnit test-case profiling results visualization.
-- [ ] [Medium] DataSet-level test discovery and per-dataset run support.
+- [x] [Medium] DataSet-level test discovery and per-dataset run support.
 - [x] [Low] In-editor latest test result gutter/margin indicators.
-- [ ] [Low] Test run hooks (`preTask` / `postTask`) integration.
+- [x] [Low] Test run hooks (`preTask` / `postTask`) integration.
 
 ## Performance and Quality Gates
 
 - [x] Completion p95 latency target: <= 30 ms in warm cache.
 - [x] Hover p95 latency target: <= 20 ms in warm cache.
 - [x] Full workspace initial index target: configurable by project size.
-- [ ] No regressions accepted without benchmark delta review.
+- [x] No regressions accepted without benchmark delta review.

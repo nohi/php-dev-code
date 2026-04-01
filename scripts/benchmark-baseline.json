@@ -1,0 +1,12 @@
+{
+  "timestamp": "2026-01-01T00:00:00.000Z",
+  "completion": {
+    "p95Ms": 25
+  },
+  "hover": {
+    "p95Ms": 15
+  },
+  "index": {
+    "durationMs": 3000
+  }
+}

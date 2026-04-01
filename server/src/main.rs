@@ -1,5 +1,5 @@
 use anyhow::Result;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, BTreeMap};
 use std::fs;
 use tokio::io::{stdin, stdout};
@@ -22,14 +22,15 @@ use tower_lsp::lsp_types::{
     FoldingRange, FoldingRangeParams,
     InlayHint, InlayHintKind, InlayHintLabel, InlayHintParams,
     InitializeResult, Location, MarkedString, MessageType, OneOf, Position,
-    PrepareRenameResponse, Range, ReferenceParams, RenameParams, TextDocumentPositionParams,
+    LinkedEditingRangeParams, LinkedEditingRangeServerCapabilities, LinkedEditingRanges,
+    PrepareRenameResponse, Range, ReferenceParams, RenameOptions, RenameParams, TextDocumentPositionParams,
     SignatureHelp, SignatureHelpOptions, SignatureHelpParams, SignatureInformation,
     ParameterInformation, ParameterLabel,
     SemanticToken, SemanticTokenType, SemanticTokens, SemanticTokensFullOptions,
     SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams,
     SemanticTokensResult, SemanticTokensServerCapabilities,
     SelectionRange, SelectionRangeParams, SelectionRangeProviderCapability,
-    TextEdit, WorkspaceEdit,
+    TextDocumentContentChangeEvent, TextEdit, WorkspaceEdit,
     ServerCapabilities, SymbolInformation, SymbolKind, TextDocumentSyncCapability,
     TextDocumentSyncKind, Url, WorkspaceSymbolParams, GotoDefinitionParams,
     GotoDefinitionResponse,
@@ -68,7 +69,10 @@ use diagnostics::{
     is_builtin_variable,
     variable_occurrences_in_line,
 };
-use fs_scan::{collect_php_files, is_blade_uri, is_php_uri, should_skip_dir};
+use fs_scan::{
+    collect_php_files, is_blade_uri, is_indexed_uri, is_ide_json_uri, is_phar_uri, is_php_uri,
+    should_skip_dir,
+};
 
 #[derive(Clone)]
 struct PhpSymbol {
@@ -97,6 +101,7 @@ struct Backend {
     symbols: RwLock<HashMap<Url, Vec<PhpSymbol>>>,
     workspace_folders: RwLock<Vec<Url>>,
     open_documents: RwLock<HashSet<Url>>,
+    rename_prepare_contexts: RwLock<HashMap<Url, PreparedRenameContext>>,
 }
 
 #[derive(Clone, Default)]
@@ -117,6 +122,12 @@ enum NamespaceDeclaration {
     Inline(String),
     Block(String),
     Global,
+}
+
+#[derive(Clone)]
+struct PreparedRenameContext {
+    name: String,
+    range: Range,
 }
 
 impl Backend {
@@ -367,8 +378,14 @@ impl LanguageServer for Backend {
                     tower_lsp::lsp_types::ImplementationProviderCapability::Simple(true),
                 ),
                 references_provider: Some(OneOf::Left(true)),
-                rename_provider: Some(OneOf::Left(true)),
+                rename_provider: Some(OneOf::Right(RenameOptions {
+                    prepare_provider: Some(true),
+                    work_done_progress_options: Default::default(),
+                })),
                 document_highlight_provider: Some(OneOf::Left(true)),
+                linked_editing_range_provider: Some(LinkedEditingRangeServerCapabilities::Simple(
+                    true,
+                )),
                 code_action_provider: Some(tower_lsp::lsp_types::CodeActionProviderCapability::Simple(true)),
                 code_lens_provider: Some(CodeLensOptions {
                     resolve_provider: Some(false),
@@ -437,9 +454,24 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        if let Some(change) = params.content_changes.into_iter().next() {
-            self.update_document(params.text_document.uri, change.text).await;
-        }
+        let uri = params.text_document.uri;
+        let current_text = {
+            let docs = self.documents.read().await;
+            docs.get(&uri).cloned().unwrap_or_default()
+        };
+
+        let Some(next_text) = apply_content_changes_to_text(&current_text, &params.content_changes) else {
+            let _ = self
+                .client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("Ignored invalid incremental change for {}", uri),
+                )
+                .await;
+            return;
+        };
+
+        self.update_document(uri, next_text).await;
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
@@ -463,13 +495,17 @@ impl LanguageServer for Backend {
             let mut open = self.open_documents.write().await;
             open.remove(&params.text_document.uri);
         }
+        {
+            let mut prepares = self.rename_prepare_contexts.write().await;
+            prepares.remove(&params.text_document.uri);
+        }
         self.clear_document_diagnostics(&params.text_document.uri).await;
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         for change in params.changes {
             let uri = change.uri;
-            if !is_php_uri(&uri) {
+            if !is_indexed_uri(&uri) {
                 continue;
             }
 
@@ -492,6 +528,10 @@ impl LanguageServer for Backend {
                         open.contains(&uri)
                     };
                     if is_open {
+                        continue;
+                    }
+
+                    if !uri.scheme().eq_ignore_ascii_case("file") || is_phar_uri(&uri) {
                         continue;
                     }
 
@@ -584,6 +624,21 @@ impl LanguageServer for Backend {
         let blade_section_context = text
             .as_deref()
             .and_then(|content| blade_section_string_completion_context(content, position));
+        let blade_view_context = text
+            .as_deref()
+            .and_then(|content| blade_view_string_completion_context(content, position));
+        let blade_tag_context = text
+            .as_deref()
+            .and_then(|content| blade_tag_name_completion_context(content, position));
+        let blade_attribute_context = text
+            .as_deref()
+            .and_then(|content| blade_component_attribute_completion_context(content, position));
+        let livewire_value_context = text
+            .as_deref()
+            .and_then(|content| blade_livewire_value_completion_context(content, position));
+        let blade_variable_context = text
+            .as_deref()
+            .and_then(|content| blade_variable_completion_context(content, position));
 
         let context_kind = text
             .as_deref()
@@ -596,6 +651,11 @@ impl LanguageServer for Backend {
                 .unwrap_or_default()
                 .to_lowercase()
         };
+        let blade_prefix = text
+            .as_deref()
+            .and_then(|content| blade_completion_prefix_at_position(content, position))
+            .unwrap_or_default()
+            .to_lowercase();
 
         let mut keyword_items = vec![
             "class",
@@ -621,6 +681,7 @@ impl LanguageServer for Backend {
 
         let mut seen: HashSet<String> = HashSet::new();
         let mut scored_items: Vec<(i32, CompletionItem)> = Vec::new();
+        let ide_json_entries = collect_ide_json_entries(&docs_snapshot);
 
         let static_context = text
             .as_deref()
@@ -699,6 +760,61 @@ impl LanguageServer for Backend {
             scored_items.push((score, item));
         }
 
+        for word in &ide_json_entries.completions {
+            if (!prefix.is_empty() && !word.to_lowercase().starts_with(&prefix))
+                || !seen.insert(word.clone())
+            {
+                continue;
+            }
+
+            let item = CompletionItem {
+                label: word.clone(),
+                kind: Some(CompletionItemKind::VALUE),
+                detail: Some("Laravel ide.json".to_string()),
+                ..CompletionItem::default()
+            };
+            let score = completion_score(&item.label, &prefix, false, item.kind, context_kind) + 18;
+            scored_items.push((score, item));
+        }
+
+        if is_blade_template {
+            for directive in &ide_json_entries.blade_directives {
+                if (!prefix.is_empty() && !directive.to_lowercase().starts_with(&prefix))
+                    || !seen.insert(directive.clone())
+                {
+                    continue;
+                }
+
+                let item = CompletionItem {
+                    label: directive.clone(),
+                    kind: Some(CompletionItemKind::KEYWORD),
+                    detail: Some("Laravel ide.json directive".to_string()),
+                    ..CompletionItem::default()
+                };
+                let score =
+                    completion_score(&item.label, &prefix, false, item.kind, context_kind) + 18;
+                scored_items.push((score, item));
+            }
+
+            for component in &ide_json_entries.blade_components {
+                if (!prefix.is_empty() && !component.to_lowercase().starts_with(&prefix))
+                    || !seen.insert(component.clone())
+                {
+                    continue;
+                }
+
+                let item = CompletionItem {
+                    label: component.clone(),
+                    kind: Some(CompletionItemKind::VALUE),
+                    detail: Some("Laravel ide.json component".to_string()),
+                    ..CompletionItem::default()
+                };
+                let score =
+                    completion_score(&item.label, &prefix, false, item.kind, context_kind) + 18;
+                scored_items.push((score, item));
+            }
+        }
+
         if route_context.is_some() {
             for route_name in collect_laravel_route_names(&docs_snapshot) {
                 if (!prefix.is_empty() && !route_name.to_lowercase().starts_with(&prefix))
@@ -739,7 +855,7 @@ impl LanguageServer for Backend {
 
         if is_blade_template && blade_section_context.is_some() {
             for section_name in collect_blade_section_names(&docs_snapshot) {
-                if (!prefix.is_empty() && !section_name.to_lowercase().starts_with(&prefix))
+                if (!blade_prefix.is_empty() && !section_name.to_lowercase().starts_with(&blade_prefix))
                     || !seen.insert(section_name.clone())
                 {
                     continue;
@@ -751,8 +867,134 @@ impl LanguageServer for Backend {
                     detail: Some("Blade section".to_string()),
                     ..CompletionItem::default()
                 };
-                let score = completion_score(&item.label, &prefix, false, item.kind, context_kind) + 24;
+                let score =
+                    completion_score(&item.label, &blade_prefix, false, item.kind, context_kind) + 24;
                 scored_items.push((score, item));
+            }
+        }
+
+        if blade_view_context.is_some() {
+            for view_id in collect_blade_view_ids(&docs_snapshot) {
+                if (!blade_prefix.is_empty() && !view_id.to_lowercase().starts_with(&blade_prefix))
+                    || !seen.insert(view_id.clone())
+                {
+                    continue;
+                }
+
+                let item = CompletionItem {
+                    label: view_id,
+                    kind: Some(CompletionItemKind::VALUE),
+                    detail: Some("Blade view".to_string()),
+                    ..CompletionItem::default()
+                };
+                let score =
+                    completion_score(&item.label, &blade_prefix, false, item.kind, context_kind) + 22;
+                scored_items.push((score, item));
+            }
+        }
+
+        if is_blade_template {
+            if let Some(tag_context) = blade_tag_context {
+                for label in collect_blade_tag_labels(&docs_snapshot, tag_context) {
+                    if (!blade_prefix.is_empty() && !label.to_lowercase().starts_with(&blade_prefix))
+                        || !seen.insert(label.clone())
+                    {
+                        continue;
+                    }
+
+                    let detail = match tag_context {
+                        BladeTagContext::X => "Blade component tag",
+                        BladeTagContext::Livewire => "Livewire component",
+                    };
+                    let item = CompletionItem {
+                        label,
+                        kind: Some(CompletionItemKind::VALUE),
+                        detail: Some(detail.to_string()),
+                        ..CompletionItem::default()
+                    };
+                    let score = completion_score(&item.label, &blade_prefix, false, item.kind, context_kind)
+                        + 20;
+                    scored_items.push((score, item));
+                }
+            }
+
+            if let Some(attribute_context) = blade_attribute_context {
+                for attribute in collect_blade_component_attributes(&docs_snapshot, attribute_context) {
+                    if (!blade_prefix.is_empty()
+                        && !attribute.to_lowercase().starts_with(&blade_prefix))
+                        || !seen.insert(attribute.clone())
+                    {
+                        continue;
+                    }
+
+                    let item = CompletionItem {
+                        label: attribute,
+                        kind: Some(CompletionItemKind::VALUE),
+                        detail: Some("Blade attribute".to_string()),
+                        ..CompletionItem::default()
+                    };
+                    let score = completion_score(&item.label, &blade_prefix, false, item.kind, context_kind)
+                        + 20;
+                    scored_items.push((score, item));
+                }
+            }
+
+            if blade_variable_context.is_some() {
+                for variable in collect_blade_template_variables(&docs_snapshot) {
+                    let variable_prefix = variable.trim_start_matches('$').to_lowercase();
+                    if (!blade_prefix.is_empty() && !variable_prefix.starts_with(&blade_prefix))
+                        || !seen.insert(variable.clone())
+                    {
+                        continue;
+                    }
+
+                    let item = CompletionItem {
+                        label: variable,
+                        kind: Some(CompletionItemKind::VARIABLE),
+                        detail: Some("Blade variable".to_string()),
+                        ..CompletionItem::default()
+                    };
+                    let score = completion_score(&item.label, &blade_prefix, false, item.kind, context_kind)
+                        + 20;
+                    scored_items.push((score, item));
+                }
+            }
+
+            if let Some(value_context) = livewire_value_context.as_ref() {
+                let members = collect_livewire_component_members(&docs_snapshot, &value_context.tag);
+                let (candidates, detail, kind, score_bias) = match value_context.kind {
+                    LivewireValueKind::Action => (
+                        members.actions,
+                        "Livewire action",
+                        CompletionItemKind::METHOD,
+                        23,
+                    ),
+                    LivewireValueKind::Property => (
+                        members.properties,
+                        "Livewire property",
+                        CompletionItemKind::FIELD,
+                        23,
+                    ),
+                };
+
+                for name in candidates {
+                    if (!blade_prefix.is_empty() && !name.to_lowercase().starts_with(&blade_prefix))
+                        || !seen.insert(name.clone())
+                    {
+                        continue;
+                    }
+
+                    let item = CompletionItem {
+                        label: name,
+                        kind: Some(kind),
+                        detail: Some(detail.to_string()),
+                        ..CompletionItem::default()
+                    };
+                    let score =
+                        completion_score(&item.label, &blade_prefix, false, item.kind, context_kind)
+                            + score_bias;
+                    scored_items.push((score, item));
+                }
             }
         }
 
@@ -1078,6 +1320,14 @@ impl LanguageServer for Backend {
                 let score = completion_score(&item.label, &prefix, local, item.kind, context_kind);
                 scored_items.push((score, item));
             }
+        }
+
+        if let Some(value_context) = livewire_value_context.as_ref() {
+            let expected_detail = match value_context.kind {
+                LivewireValueKind::Action => "Livewire action",
+                LivewireValueKind::Property => "Livewire property",
+            };
+            scored_items.retain(|(_, item)| item.detail.as_deref() == Some(expected_detail));
         }
 
         scored_items.sort_by(|a, b| {
@@ -1561,6 +1811,31 @@ impl LanguageServer for Backend {
         Ok(Some(highlights))
     }
 
+    async fn linked_editing_range(
+        &self,
+        params: LinkedEditingRangeParams,
+    ) -> LspResult<Option<LinkedEditingRanges>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        let text = {
+            let docs = self.documents.read().await;
+            docs.get(&uri).cloned()
+        };
+        let Some(text) = text else {
+            return Ok(None);
+        };
+
+        let Some(ranges) = linked_editing_ranges_at_position(&text, position) else {
+            return Ok(None);
+        };
+
+        Ok(Some(LinkedEditingRanges {
+            ranges,
+            word_pattern: None,
+        }))
+    }
+
     async fn selection_range(
         &self,
         params: SelectionRangeParams,
@@ -1593,13 +1868,23 @@ impl LanguageServer for Backend {
                 if !is_code_position(text, position) {
                     return None;
                 }
-                identifier_and_range_at_position(text, position)
+                identifier_and_range_at_position_for_rename(text, position)
             })
         };
 
         let Some((name, range)) = result else {
             return Ok(None);
         };
+        {
+            let mut prepares = self.rename_prepare_contexts.write().await;
+            prepares.insert(
+                uri,
+                PreparedRenameContext {
+                    name: name.clone(),
+                    range,
+                },
+            );
+        }
 
         Ok(Some(PrepareRenameResponse::RangeWithPlaceholder {
             range,
@@ -1618,18 +1903,33 @@ impl LanguageServer for Backend {
                 if !is_code_position(text, position) {
                     return None;
                 }
-                let old_name = identifier_at_position(text, position)?;
+                let (old_name, old_range) = identifier_and_range_at_position_for_rename(text, position)?;
                 let queries = resolve_symbol_queries(text, position, &old_name);
-                Some((old_name, queries))
+                Some((old_name, old_range, queries))
             })
         };
 
-        let Some((old_name, queries)) = context else {
+        let Some((old_name, old_range, queries)) = context else {
             return Ok(None);
         };
 
         if old_name.starts_with('$') && !new_name.starts_with('$') {
             new_name = format!("${new_name}");
+        }
+
+        let prepare_context = {
+            let mut prepares = self.rename_prepare_contexts.write().await;
+            prepares.remove(&uri)
+        };
+        if let Some(prepared) = prepare_context.filter(|ctx| {
+            is_position_within_or_at_end_of_range(position, ctx.range)
+                || (old_range.start == ctx.range.start
+                    && old_range.end.line == ctx.range.end.line
+                    && old_range.end.character >= ctx.range.end.character
+                    && old_name.starts_with(&ctx.name))
+        })
+        {
+            new_name = normalize_rename_name_after_prepare(&prepared.name, &old_name, &new_name);
         }
 
         if new_name.is_empty() || !is_valid_identifier_name(&new_name) {
@@ -1667,16 +1967,7 @@ impl LanguageServer for Backend {
                 continue;
             }
 
-            edits.sort_by(|a, b| {
-                a.range
-                    .start
-                    .line
-                    .cmp(&b.range.start.line)
-                    .then_with(|| a.range.start.character.cmp(&b.range.start.character))
-            });
-            edits.dedup_by(|a, b| a.range == b.range);
-
-            changes.insert(doc_uri, edits);
+            insert_sanitized_text_edits(&mut changes, doc_uri, &text, edits);
         }
 
         if changes.is_empty() {
@@ -2774,10 +3065,198 @@ fn is_position_within_range(pos: Position, range: Range) -> bool {
     if pos.line == range.start.line && pos.character < range.start.character {
         return false;
     }
+    if pos.line == range.end.line && pos.character >= range.end.character {
+        return false;
+    }
+    true
+}
+
+fn is_position_within_or_at_end_of_range(pos: Position, range: Range) -> bool {
+    if pos.line < range.start.line || pos.line > range.end.line {
+        return false;
+    }
+    if pos.line == range.start.line && pos.character < range.start.character {
+        return false;
+    }
     if pos.line == range.end.line && pos.character > range.end.character {
         return false;
     }
     true
+}
+
+fn normalize_rename_name_after_prepare(
+    prepared_name: &str,
+    current_name: &str,
+    requested_name: &str,
+) -> String {
+    if prepared_name.is_empty() || requested_name.is_empty() || prepared_name == current_name {
+        return requested_name.to_string();
+    }
+
+    if current_name == requested_name {
+        return requested_name.to_string();
+    }
+
+    let Some(already_applied_suffix) = current_name.strip_prefix(prepared_name) else {
+        return requested_name.to_string();
+    };
+    if already_applied_suffix.is_empty() {
+        return requested_name.to_string();
+    }
+
+    if let Some(requested_tail) = requested_name.strip_prefix(current_name) {
+        if requested_tail == already_applied_suffix {
+            return current_name.to_string();
+        }
+    }
+
+    requested_name.to_string()
+}
+
+fn sanitize_text_edits_for_document(text: &str, edits: Vec<TextEdit>) -> Vec<TextEdit> {
+    let mut valid = edits
+        .into_iter()
+        .filter(|edit| is_valid_range_for_text(text, edit.range))
+        .collect::<Vec<_>>();
+    valid.sort_by(|a, b| {
+        a.range
+            .start
+            .line
+            .cmp(&b.range.start.line)
+            .then_with(|| a.range.start.character.cmp(&b.range.start.character))
+            .then_with(|| b.range.end.line.cmp(&a.range.end.line))
+            .then_with(|| b.range.end.character.cmp(&a.range.end.character))
+    });
+    valid.dedup_by(|a, b| a.range == b.range);
+
+    let mut non_overlapping = Vec::new();
+    let mut last_end: Option<Position> = None;
+    for edit in valid {
+        if let Some(prev_end) = last_end {
+            if !is_position_at_or_after(edit.range.start, prev_end) {
+                continue;
+            }
+        }
+        last_end = Some(edit.range.end);
+        non_overlapping.push(edit);
+    }
+
+    non_overlapping.sort_by(|a, b| {
+        b.range
+            .start
+            .line
+            .cmp(&a.range.start.line)
+            .then_with(|| b.range.start.character.cmp(&a.range.start.character))
+            .then_with(|| b.range.end.line.cmp(&a.range.end.line))
+            .then_with(|| b.range.end.character.cmp(&a.range.end.character))
+    });
+    non_overlapping
+}
+
+fn insert_sanitized_text_edits(
+    changes: &mut HashMap<Url, Vec<TextEdit>>,
+    doc_uri: Url,
+    text: &str,
+    edits: Vec<TextEdit>,
+) {
+    let sanitized = sanitize_text_edits_for_document(text, edits);
+    if sanitized.is_empty() {
+        return;
+    }
+    changes.insert(doc_uri, sanitized);
+}
+
+fn is_position_at_or_after(pos: Position, boundary: Position) -> bool {
+    pos.line > boundary.line || (pos.line == boundary.line && pos.character >= boundary.character)
+}
+
+fn is_valid_range_for_text(text: &str, range: Range) -> bool {
+    if !is_position_at_or_after(range.end, range.start) {
+        return false;
+    }
+
+    let lines = text
+        .lines()
+        .map(|line| line.encode_utf16().count() as u32)
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return range.start == Position::new(0, 0) && range.end == Position::new(0, 0);
+    }
+
+    let last_line = lines.len() as u32 - 1;
+    if range.start.line > last_line || range.end.line > last_line {
+        return false;
+    }
+
+    let start_len = lines[range.start.line as usize];
+    let end_len = lines[range.end.line as usize];
+    range.start.character <= start_len && range.end.character <= end_len
+}
+
+fn apply_content_changes_to_text(
+    current: &str,
+    changes: &[TextDocumentContentChangeEvent],
+) -> Option<String> {
+    let mut text = current.to_string();
+    for change in changes {
+        if let Some(range) = change.range {
+            let start = utf16_position_to_byte_offset(&text, range.start)?;
+            let end = utf16_position_to_byte_offset(&text, range.end)?;
+            if end < start {
+                return None;
+            }
+            text.replace_range(start..end, &change.text);
+        } else {
+            text = change.text.clone();
+        }
+    }
+    Some(text)
+}
+
+fn utf16_position_to_byte_offset(text: &str, position: Position) -> Option<usize> {
+    let mut line_starts = vec![0usize];
+    for (idx, ch) in text.char_indices() {
+        if ch == '\n' {
+            line_starts.push(idx + ch.len_utf8());
+        }
+    }
+
+    let line_idx = position.line as usize;
+    let line_start = *line_starts.get(line_idx)?;
+    let line_end_raw = if line_idx + 1 < line_starts.len() {
+        line_starts[line_idx + 1]
+    } else {
+        text.len()
+    };
+    let mut line = &text[line_start..line_end_raw];
+    if line.ends_with('\n') {
+        line = &line[..line.len().saturating_sub(1)];
+    }
+    if line.ends_with('\r') {
+        line = &line[..line.len().saturating_sub(1)];
+    }
+
+    let rel = utf16_column_to_byte_offset(line, position.character)?;
+    Some(line_start + rel)
+}
+
+fn utf16_column_to_byte_offset(line: &str, column: u32) -> Option<usize> {
+    let mut consumed = 0u32;
+    for (idx, ch) in line.char_indices() {
+        if consumed == column {
+            return Some(idx);
+        }
+        consumed += ch.len_utf16() as u32;
+        if consumed > column {
+            return None;
+        }
+    }
+
+    if consumed == column {
+        Some(line.len())
+    } else {
+        None
+    }
 }
 
 fn find_symbol_location_for_queries<'a>(
@@ -5932,6 +6411,127 @@ fn collect_laravel_route_names(docs: &HashMap<Url, String>) -> Vec<String> {
     out
 }
 
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+struct IdeJsonEntries {
+    completions: Vec<String>,
+    blade_directives: Vec<String>,
+    blade_components: Vec<String>,
+}
+
+fn collect_ide_json_entries(docs: &HashMap<Url, String>) -> IdeJsonEntries {
+    let mut completions = HashSet::new();
+    let mut blade_directives = HashSet::new();
+    let mut blade_components = HashSet::new();
+
+    for (uri, text) in docs {
+        if !is_ide_json_uri(uri) {
+            continue;
+        }
+        let parsed = parse_ide_json_entries(text);
+        completions.extend(parsed.completions);
+        blade_directives.extend(parsed.blade_directives);
+        blade_components.extend(parsed.blade_components);
+    }
+
+    let mut completions = completions.into_iter().collect::<Vec<_>>();
+    completions.sort();
+    let mut blade_directives = blade_directives.into_iter().collect::<Vec<_>>();
+    blade_directives.sort();
+    let mut blade_components = blade_components.into_iter().collect::<Vec<_>>();
+    blade_components.sort();
+
+    IdeJsonEntries {
+        completions,
+        blade_directives,
+        blade_components,
+    }
+}
+
+fn parse_ide_json_entries(text: &str) -> IdeJsonEntries {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return IdeJsonEntries::default();
+    };
+
+    let completions = value
+        .get("completions")
+        .map(extract_ide_json_names)
+        .unwrap_or_default();
+    let blade_directives = value
+        .get("blade")
+        .and_then(|blade| blade.get("directives"))
+        .map(extract_ide_json_names)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|directive| normalize_ide_json_entry(&directive))
+        .map(|directive| {
+            if directive.starts_with('@') {
+                directive
+            } else {
+                format!("@{directive}")
+            }
+        })
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut blade_components = HashSet::new();
+    for component in value
+        .get("blade")
+        .and_then(|blade| blade.get("components"))
+        .map(extract_ide_json_names)
+        .unwrap_or_default()
+    {
+        let Some(component) = normalize_ide_json_entry(&component) else {
+            continue;
+        };
+        if component.starts_with("x-") {
+            blade_components.insert(component);
+        } else {
+            blade_components.insert(component.clone());
+            blade_components.insert(format!("x-{component}"));
+        }
+    }
+
+    let mut completions = completions
+        .into_iter()
+        .filter_map(|entry| normalize_ide_json_entry(&entry))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    completions.sort();
+
+    let mut blade_directives = blade_directives;
+    blade_directives.sort();
+    let mut blade_components = blade_components.into_iter().collect::<Vec<_>>();
+    blade_components.sort();
+
+    IdeJsonEntries {
+        completions,
+        blade_directives,
+        blade_components,
+    }
+}
+
+fn extract_ide_json_names(value: &Value) -> Vec<String> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(|value| value.to_string()))
+            .collect(),
+        Value::Object(map) => map.keys().cloned().collect(),
+        Value::String(value) => vec![value.clone()],
+        _ => Vec::new(),
+    }
+}
+
+fn normalize_ide_json_entry(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 
 fn collect_blade_section_names(docs: &HashMap<Url, String>) -> Vec<String> {
     let mut names = HashSet::new();
@@ -6012,6 +6612,744 @@ fn blade_section_string_completion_context(text: &str, position: Position) -> Op
     }
 
     None
+}
+
+fn blade_view_string_completion_context(text: &str, position: Position) -> Option<char> {
+    let line = text.lines().nth(position.line as usize)?;
+    let idx = (position.character as usize).min(line.len());
+    let prefix = &line[..idx];
+    for target in ["@include", "@extends", "@component", "view"] {
+        let single = format!("{target}('");
+        let double = format!("{target}(\"");
+        if prefix.contains(&single) {
+            return Some('\'');
+        }
+        if prefix.contains(&double) {
+            return Some('"');
+        }
+    }
+    None
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum BladeTagContext {
+    X,
+    Livewire,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum LivewireValueKind {
+    Action,
+    Property,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LivewireValueCompletionContext {
+    tag: String,
+    kind: LivewireValueKind,
+}
+
+#[derive(Default)]
+struct LivewireComponentMembers {
+    actions: HashSet<String>,
+    properties: HashSet<String>,
+}
+
+fn blade_tag_name_completion_context(text: &str, position: Position) -> Option<BladeTagContext> {
+    let line = text.lines().nth(position.line as usize)?;
+    let idx = (position.character as usize).min(line.len());
+    let prefix = &line[..idx];
+
+    let x_idx = prefix.rfind("<x-");
+    let livewire_idx = prefix.rfind("<livewire:");
+    let (ctx, start_idx) = match (x_idx, livewire_idx) {
+        (Some(x), Some(l)) if l > x => (BladeTagContext::Livewire, l + "<livewire:".len()),
+        (Some(x), Some(_)) => (BladeTagContext::X, x + "<x-".len()),
+        (Some(x), None) => (BladeTagContext::X, x + "<x-".len()),
+        (None, Some(l)) => (BladeTagContext::Livewire, l + "<livewire:".len()),
+        (None, None) => return None,
+    };
+
+    let since_start = &prefix[start_idx..];
+    if since_start.contains('>') || since_start.contains('<') || since_start.contains(' ') {
+        return None;
+    }
+    Some(ctx)
+}
+
+fn blade_component_attribute_completion_context(
+    text: &str,
+    position: Position,
+) -> Option<BladeTagContext> {
+    let line = text.lines().nth(position.line as usize)?;
+    let idx = (position.character as usize).min(line.len());
+    let prefix = &line[..idx];
+
+    let x_idx = prefix.rfind("<x-");
+    let livewire_idx = prefix.rfind("<livewire:");
+    let (ctx, tag_start) = match (x_idx, livewire_idx) {
+        (Some(x), Some(l)) if l > x => (BladeTagContext::Livewire, l),
+        (Some(x), Some(_)) => (BladeTagContext::X, x),
+        (Some(x), None) => (BladeTagContext::X, x),
+        (None, Some(l)) => (BladeTagContext::Livewire, l),
+        (None, None) => return None,
+    };
+
+    let tag_fragment = &prefix[tag_start..];
+    if tag_fragment.contains('>') || !tag_fragment.contains(' ') {
+        return None;
+    }
+    Some(ctx)
+}
+
+fn blade_livewire_value_completion_context(
+    text: &str,
+    position: Position,
+) -> Option<LivewireValueCompletionContext> {
+    let line = text.lines().nth(position.line as usize)?;
+    let idx = (position.character as usize).min(line.len());
+    let prefix = &line[..idx];
+    let tag_start = prefix.rfind("<livewire:")?;
+    let tag_fragment = &prefix[tag_start..];
+    if tag_fragment.contains('>') {
+        return None;
+    }
+
+    let tag_name = extract_livewire_tag_name_from_fragment(tag_fragment)?;
+    let action = detect_livewire_attribute_value_context(tag_fragment, "wire:click")
+        .map(|_| LivewireValueKind::Action);
+    let property = detect_livewire_attribute_value_context(tag_fragment, "wire:model")
+        .map(|_| LivewireValueKind::Property);
+    let kind = match (action, property) {
+        (Some(kind), None) => kind,
+        (None, Some(kind)) => kind,
+        (Some(_), Some(kind)) => kind,
+        (None, None) => return None,
+    };
+
+    Some(LivewireValueCompletionContext {
+        tag: tag_name,
+        kind,
+    })
+}
+
+fn extract_livewire_tag_name_from_fragment(fragment: &str) -> Option<String> {
+    let rest = fragment.strip_prefix("<livewire:")?;
+    let mut end = 0usize;
+    for ch in rest.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.' || ch == ':' {
+            end += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if end == 0 {
+        return None;
+    }
+    let tag = rest[..end].trim().to_string();
+    if tag.is_empty() {
+        None
+    } else {
+        Some(tag)
+    }
+}
+
+fn detect_livewire_attribute_value_context(fragment: &str, attribute: &str) -> Option<char> {
+    let mut best_match: Option<(usize, char)> = None;
+    for quote in ['"', '\''] {
+        let marker = format!("{attribute}={quote}");
+        if let Some(idx) = fragment.rfind(&marker) {
+            if best_match
+                .map(|(current_idx, _)| idx > current_idx)
+                .unwrap_or(true)
+            {
+                best_match = Some((idx + marker.len(), quote));
+            }
+        }
+    }
+    let (value_start, quote) = best_match?;
+    let tail = &fragment[value_start..];
+    if tail.contains(quote) {
+        return None;
+    }
+    Some(quote)
+}
+
+fn infer_livewire_component_class_candidates(tag: &str) -> Vec<String> {
+    let normalized = tag
+        .trim()
+        .trim_start_matches("livewire:")
+        .trim_matches(|ch| ch == '"' || ch == '\'')
+        .trim();
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+
+    let path_segments = normalized
+        .split(['.', ':', '/'])
+        .filter_map(|segment| {
+            let converted = kebab_segment_to_pascal_case(segment);
+            if converted.is_empty() {
+                None
+            } else {
+                Some(converted)
+            }
+        })
+        .collect::<Vec<_>>();
+    if path_segments.is_empty() {
+        return Vec::new();
+    }
+
+    let class_name = path_segments.last().cloned().unwrap_or_default();
+    let namespace_path = if path_segments.len() > 1 {
+        path_segments[..path_segments.len() - 1].join("\\")
+    } else {
+        String::new()
+    };
+    let mut candidates = Vec::new();
+    candidates.push(class_name.clone());
+    if namespace_path.is_empty() {
+        candidates.push(format!("App\\Livewire\\{class_name}"));
+        candidates.push(format!("App\\Http\\Livewire\\{class_name}"));
+    } else {
+        candidates.push(format!("App\\Livewire\\{}\\{class_name}", namespace_path));
+        candidates.push(format!(
+            "App\\Http\\Livewire\\{}\\{class_name}",
+            namespace_path
+        ));
+        candidates.push(format!("{namespace_path}\\{class_name}"));
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn kebab_segment_to_pascal_case(segment: &str) -> String {
+    segment
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            let mut out = String::new();
+            if let Some(first) = chars.next() {
+                out.extend(first.to_uppercase());
+                out.push_str(chars.as_str());
+            }
+            out
+        })
+        .collect::<String>()
+}
+
+fn blade_variable_completion_context(text: &str, position: Position) -> Option<()> {
+    let line = text.lines().nth(position.line as usize)?;
+    let idx = (position.character as usize).min(line.len());
+    let prefix = &line[..idx];
+    if prefix.ends_with('$')
+        || prefix
+            .chars()
+            .last()
+            .map(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            .unwrap_or(false)
+            && prefix.contains('$')
+    {
+        let dollar_idx = prefix.rfind('$')?;
+        let tail = &prefix[dollar_idx + 1..];
+        if tail.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+            return Some(());
+        }
+    }
+    None
+}
+
+fn blade_completion_prefix_at_position(text: &str, position: Position) -> Option<String> {
+    let line = text.lines().nth(position.line as usize)?;
+    let chars: Vec<char> = line.chars().collect();
+    let mut idx = (position.character as usize).min(chars.len());
+    while idx > 0 {
+        let ch = chars[idx - 1];
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.' || ch == ':' {
+            idx -= 1;
+            continue;
+        }
+        break;
+    }
+    let prefix: String = chars[idx..(position.character as usize).min(chars.len())]
+        .iter()
+        .collect();
+    Some(prefix.trim_start_matches('$').to_string())
+}
+
+fn collect_blade_view_ids(docs: &HashMap<Url, String>) -> Vec<String> {
+    let mut out = HashSet::new();
+    for uri in docs.keys() {
+        if let Some(id) = blade_view_id_from_uri(uri) {
+            out.insert(id);
+        }
+    }
+    let mut values = out.into_iter().collect::<Vec<_>>();
+    values.sort();
+    values
+}
+
+fn blade_view_id_from_uri(uri: &Url) -> Option<String> {
+    let path = uri.path().replace('\\', "/");
+    let lower = path.to_ascii_lowercase();
+    let marker = "/resources/views/";
+    let idx = lower.find(marker)?;
+    let mut relative = path[idx + marker.len()..].to_string();
+    if !relative.to_ascii_lowercase().ends_with(".blade.php") {
+        return None;
+    }
+    relative.truncate(relative.len().saturating_sub(".blade.php".len()));
+    let value = relative.replace('/', ".").trim_matches('.').to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn collect_blade_tag_labels(docs: &HashMap<Url, String>, ctx: BladeTagContext) -> Vec<String> {
+    let mut names = HashSet::new();
+    for (uri, text) in docs {
+        if matches!(ctx, BladeTagContext::X) {
+            names.extend(extract_blade_component_names_from_uri(uri));
+        }
+        names.extend(extract_blade_tag_names_from_text(text, ctx));
+    }
+    let mut out = names
+        .into_iter()
+        .map(|name| match ctx {
+            BladeTagContext::X => normalize_x_tag_label(&name),
+            BladeTagContext::Livewire => normalize_livewire_tag_label(&name),
+        })
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn extract_blade_component_names_from_uri(uri: &Url) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let path = uri.path().replace('\\', "/");
+    let lower = path.to_ascii_lowercase();
+    let marker = "/resources/views/components/";
+    if let Some(idx) = lower.find(marker) {
+        let mut relative = path[idx + marker.len()..].to_string();
+        if relative.to_ascii_lowercase().ends_with(".blade.php") {
+            relative.truncate(relative.len().saturating_sub(".blade.php".len()));
+            let normalized = relative.replace('/', ".").trim_matches('.').to_string();
+            if !normalized.is_empty() {
+                out.insert(normalized);
+            }
+        }
+    }
+    out
+}
+
+fn extract_blade_tag_names_from_text(text: &str, ctx: BladeTagContext) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let needle = match ctx {
+        BladeTagContext::X => "<x-",
+        BladeTagContext::Livewire => "<livewire:",
+    };
+    let mut rest = text;
+    while let Some(idx) = rest.find(needle) {
+        let after = &rest[idx + needle.len()..];
+        let mut end = 0usize;
+        for ch in after.chars() {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.' || ch == ':' {
+                end += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if end > 0 {
+            let raw = after[..end].trim().to_string();
+            if !raw.is_empty() {
+                out.insert(raw);
+            }
+        }
+        rest = after;
+    }
+    out
+}
+
+fn normalize_x_tag_label(name: &str) -> String {
+    let trimmed = name.trim().trim_start_matches("x-");
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    format!("x-{trimmed}")
+}
+
+fn normalize_livewire_tag_label(name: &str) -> String {
+    let trimmed = name.trim().trim_start_matches("livewire:");
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    format!("livewire:{trimmed}")
+}
+
+fn collect_blade_component_attributes(
+    docs: &HashMap<Url, String>,
+    ctx: BladeTagContext,
+) -> Vec<String> {
+    let mut attrs = HashSet::new();
+    for text in docs.values() {
+        attrs.extend(extract_blade_attributes_from_text(text, ctx));
+    }
+    if attrs.is_empty() {
+        for default in default_blade_attributes(ctx) {
+            attrs.insert(default.to_string());
+        }
+    }
+    let mut out = attrs.into_iter().collect::<Vec<_>>();
+    out.sort();
+    out
+}
+
+fn extract_blade_attributes_from_text(text: &str, ctx: BladeTagContext) -> HashSet<String> {
+    let mut attrs = HashSet::new();
+    let needle = match ctx {
+        BladeTagContext::X => "<x-",
+        BladeTagContext::Livewire => "<livewire:",
+    };
+    let mut rest = text;
+    while let Some(idx) = rest.find(needle) {
+        let after = &rest[idx + needle.len()..];
+        if let Some(close_idx) = after.find('>') {
+            let inside = &after[..close_idx];
+            for attribute in parse_tag_attribute_names(inside) {
+                attrs.insert(attribute);
+            }
+            rest = &after[close_idx + 1..];
+        } else {
+            break;
+        }
+    }
+    attrs
+}
+
+fn parse_tag_attribute_names(fragment: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let tokens = split_tag_fragment_tokens(fragment);
+    for token in tokens.iter().skip(1) {
+        let cleaned = token.trim().trim_end_matches('/').trim();
+        if cleaned.is_empty() {
+            continue;
+        }
+        let name = cleaned.split_once('=').map(|(left, _)| left).unwrap_or(cleaned).trim();
+        if is_valid_blade_attribute_name(name) {
+            out.insert(name.to_string());
+        }
+    }
+    out
+}
+
+fn split_tag_fragment_tokens(fragment: &str) -> Vec<String> {
+    let chars: Vec<char> = fragment.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= chars.len() {
+            break;
+        }
+        let start = i;
+        let mut quote: Option<char> = None;
+        while i < chars.len() {
+            let ch = chars[i];
+            if let Some(active) = quote {
+                if ch == '\\' {
+                    i = (i + 2).min(chars.len());
+                    continue;
+                }
+                if ch == active {
+                    quote = None;
+                }
+                i += 1;
+                continue;
+            }
+            if ch == '"' || ch == '\'' {
+                quote = Some(ch);
+                i += 1;
+                continue;
+            }
+            if ch.is_whitespace() {
+                break;
+            }
+            i += 1;
+        }
+        let token: String = chars[start..i].iter().collect();
+        if !token.is_empty() {
+            out.push(token);
+        }
+    }
+    out
+}
+
+fn is_valid_blade_attribute_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == ':' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.' || ch == ':')
+}
+
+fn default_blade_attributes(ctx: BladeTagContext) -> Vec<&'static str> {
+    match ctx {
+        BladeTagContext::X => vec!["class", "id", ":class"],
+        BladeTagContext::Livewire => vec!["wire:key", "wire:model", "wire:click"],
+    }
+}
+
+fn collect_blade_template_variables(docs: &HashMap<Url, String>) -> Vec<String> {
+    let mut vars = HashSet::new();
+    vars.insert("$slot".to_string());
+    vars.insert("$attributes".to_string());
+    for (uri, text) in docs {
+        if is_blade_uri(uri) || looks_like_blade_template(text) {
+            vars.extend(extract_blade_variables_from_text(text));
+        }
+    }
+    let mut out = vars.into_iter().collect::<Vec<_>>();
+    out.sort();
+    out
+}
+
+fn collect_livewire_component_members(
+    docs: &HashMap<Url, String>,
+    tag: &str,
+) -> LivewireComponentMembers {
+    let candidates = infer_livewire_component_class_candidates(tag);
+    if candidates.is_empty() {
+        return LivewireComponentMembers::default();
+    }
+
+    let candidate_fqn = candidates
+        .iter()
+        .filter(|value| value.contains('\\'))
+        .map(|value| value.trim_start_matches('\\').to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let candidate_short = candidates
+        .iter()
+        .map(|value| {
+            value
+                .rsplit_once('\\')
+                .map(|(_, short)| short)
+                .unwrap_or(value)
+                .to_ascii_lowercase()
+        })
+        .collect::<HashSet<_>>();
+
+    let mut members = LivewireComponentMembers::default();
+    let lifecycle = livewire_lifecycle_method_names();
+
+    for text in docs.values() {
+        let symbols = extract_symbols(text);
+        let mut class_ranges = symbols
+            .iter()
+            .filter(|symbol| {
+                if !is_type_symbol_kind(symbol.kind) {
+                    return false;
+                }
+                let fqn = symbol.fqn().trim_start_matches('\\').to_ascii_lowercase();
+                if candidate_fqn.contains(&fqn) {
+                    return true;
+                }
+                let short_match = candidate_short.contains(&symbol.name.to_ascii_lowercase());
+                if !short_match {
+                    return false;
+                }
+                symbol
+                    .namespace
+                    .as_deref()
+                    .map(|namespace| namespace.to_ascii_lowercase().contains("livewire"))
+                    .unwrap_or(false)
+            })
+            .map(|symbol| symbol.range.start.line as usize)
+            .collect::<Vec<_>>();
+        class_ranges.sort();
+        class_ranges.dedup();
+        if class_ranges.is_empty() {
+            continue;
+        }
+
+        let lines = text.lines().collect::<Vec<_>>();
+        for start_line in class_ranges {
+            let class_block = extract_class_block_text_from_lines(&lines, start_line);
+            if class_block.trim().is_empty() {
+                continue;
+            }
+            let extracted = extract_livewire_public_members_from_class_text(&class_block, &lifecycle);
+            members.actions.extend(extracted.actions);
+            members.properties.extend(extracted.properties);
+        }
+    }
+
+    members
+}
+
+fn extract_class_block_text_from_lines(lines: &[&str], class_start_line: usize) -> String {
+    if class_start_line >= lines.len() {
+        return String::new();
+    }
+
+    let mut collected = String::new();
+    let mut started = false;
+    let mut depth = 0i32;
+    for line in lines.iter().skip(class_start_line) {
+        if !collected.is_empty() {
+            collected.push('\n');
+        }
+        collected.push_str(line);
+
+        for ch in line.chars() {
+            if ch == '{' {
+                started = true;
+                depth += 1;
+            } else if ch == '}' && started {
+                depth -= 1;
+            }
+        }
+
+        if started && depth <= 0 {
+            break;
+        }
+    }
+    collected
+}
+
+fn extract_livewire_public_members_from_class_text(
+    class_text: &str,
+    lifecycle: &HashSet<&'static str>,
+) -> LivewireComponentMembers {
+    let mut members = LivewireComponentMembers::default();
+    let lines = class_text.split('\n').collect::<Vec<_>>();
+    let mut in_block_comment = false;
+    let mut depth = 0i32;
+    for (line_idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if depth == 1 {
+            if let Some(name) = token_after_keyword(trimmed, "function") {
+                let lower = name.to_ascii_lowercase();
+                let is_private_or_protected =
+                    trimmed.contains("private ") || trimmed.contains("protected ");
+                let is_static = trimmed.contains(" static ") || trimmed.starts_with("static ");
+                if !is_private_or_protected
+                    && !is_static
+                    && !name.starts_with("__")
+                    && !is_livewire_lifecycle_method(lower.as_str(), lifecycle)
+                {
+                    members.actions.insert(name);
+                }
+            }
+
+            if trimmed.contains("function __construct")
+                && trimmed.contains("public")
+                && !trimmed.contains("static")
+            {
+                for promoted in extract_promoted_property_entries_from_lines(&lines, line_idx) {
+                    if !promoted.name.is_empty() {
+                        members.properties.insert(promoted.name);
+                    }
+                }
+            }
+
+            if let Some(col) = trimmed.find('$') {
+                let declaration_head = &trimmed[..col];
+                let head_lower = declaration_head.to_ascii_lowercase();
+                let is_public =
+                    head_lower.contains("public") || head_lower.split_whitespace().any(|p| p == "var");
+                let is_private_or_protected =
+                    head_lower.contains("private") || head_lower.contains("protected");
+                let is_static = head_lower.contains("static");
+                if is_public && !is_private_or_protected && !is_static {
+                    let tail = &trimmed[col..];
+                    for segment in tail.split(',') {
+                        if let Some(var_name) = extract_first_variable_name(segment) {
+                            let prop = var_name.trim_start_matches('$').to_string();
+                            if !prop.is_empty() {
+                                members.properties.insert(prop);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let chars = line.chars().collect::<Vec<_>>();
+        let mask = code_mask_for_line(&chars, &mut in_block_comment);
+        for (idx, ch) in chars.iter().enumerate() {
+            if !mask.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            if *ch == '{' {
+                depth += 1;
+            } else if *ch == '}' {
+                depth -= 1;
+            }
+        }
+        if depth <= 0 && !members.actions.is_empty() && !members.properties.is_empty() {
+            break;
+        }
+    }
+    members
+}
+
+fn livewire_lifecycle_method_names() -> HashSet<&'static str> {
+    [
+        "boot",
+        "booted",
+        "mount",
+        "hydrate",
+        "dehydrate",
+        "updating",
+        "updated",
+        "rendering",
+        "rendered",
+        "render",
+        "exception",
+    ]
+        .into_iter()
+        .collect()
+}
+
+fn is_livewire_lifecycle_method(name_lower: &str, lifecycle: &HashSet<&'static str>) -> bool {
+    lifecycle.contains(name_lower)
+        || name_lower.starts_with("hydrate")
+        || name_lower.starts_with("dehydrate")
+        || name_lower.starts_with("updating")
+        || name_lower.starts_with("updated")
+}
+
+fn extract_blade_variables_from_text(text: &str) -> HashSet<String> {
+    let mut vars = HashSet::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] != '$' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        i += 1;
+        while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+            i += 1;
+        }
+        if i > start + 1 {
+            let value: String = chars[start..i].iter().collect();
+            vars.insert(value);
+        }
+    }
+    vars
 }
 fn extract_laravel_route_names_from_text(text: &str) -> HashSet<String> {
     let mut names = HashSet::new();
@@ -6220,6 +7558,34 @@ fn identifier_and_range_at_position(text: &str, position: Position) -> Option<(S
     }
 }
 
+fn identifier_and_range_at_position_for_rename(
+    text: &str,
+    position: Position,
+) -> Option<(String, Range)> {
+    let line = text.lines().nth(position.line as usize)?;
+    let chars: Vec<char> = line.chars().collect();
+    if chars.is_empty() {
+        return None;
+    }
+
+    let idx = position.character as usize;
+    if idx < chars.len() {
+        if !is_identifier_char(chars[idx]) {
+            if idx == 0 || !is_identifier_char(chars[idx - 1]) {
+                return None;
+            }
+        }
+    } else if !is_identifier_char(*chars.last()?) {
+        return None;
+    }
+
+    let (ident, range) = identifier_and_range_at_position(text, position)?;
+    if !is_position_within_or_at_end_of_range(position, range) && position.character as usize != chars.len() {
+        return None;
+    }
+    Some((ident, range))
+}
+
 fn selection_ranges_for_positions(text: &str, positions: &[Position]) -> Vec<SelectionRange> {
     let mut out = Vec::new();
 
@@ -6335,6 +7701,59 @@ fn find_identifier_ranges(text: &str, target: &str) -> Vec<Range> {
     }
 
     ranges
+}
+
+fn linked_editing_ranges_at_position(text: &str, position: Position) -> Option<Vec<Range>> {
+    if !is_code_position(text, position) {
+        return None;
+    }
+
+    let (identifier, identifier_range) = identifier_and_range_at_position(text, position)?;
+    if !identifier.starts_with('$') {
+        return None;
+    }
+    if is_builtin_variable(&identifier) {
+        return None;
+    }
+
+    let locals_before_cursor = extract_local_variables_before_position(text, identifier_range.start);
+    let has_prior_local = locals_before_cursor.iter().any(|name| name == &identifier);
+    let is_assignment_target = is_variable_assignment_target(text, identifier_range);
+    if !has_prior_local && !is_assignment_target {
+        return None;
+    }
+
+    let ranges = find_identifier_ranges(text, &identifier);
+    if ranges.is_empty() {
+        return None;
+    }
+
+    Some(ranges)
+}
+
+fn is_variable_assignment_target(text: &str, range: Range) -> bool {
+    let line = text.lines().nth(range.end.line as usize).unwrap_or_default();
+    let chars: Vec<char> = line.chars().collect();
+    let mut idx = range.end.character as usize;
+    while idx < chars.len() && chars[idx].is_whitespace() {
+        idx += 1;
+    }
+    if idx >= chars.len() {
+        return false;
+    }
+
+    let tail: String = chars[idx..].iter().collect();
+    tail.starts_with('=')
+        || tail.starts_with("+=")
+        || tail.starts_with("-=")
+        || tail.starts_with("*=")
+        || tail.starts_with("/=")
+        || tail.starts_with("%=")
+        || tail.starts_with(".=")
+        || tail.starts_with("&=")
+        || tail.starts_with("|=")
+        || tail.starts_with("^=")
+        || tail.starts_with("??=")
 }
 
 fn is_code_position(text: &str, position: Position) -> bool {
@@ -6548,7 +7967,9 @@ async fn main() -> Result<()> {
         symbols: RwLock::new(HashMap::new()),
         workspace_folders: RwLock::new(Vec::new()),
         open_documents: RwLock::new(HashSet::new()),
+        rename_prepare_contexts: RwLock::new(HashMap::new()),
     });
     Server::new(stdin(), stdout(), socket).serve(service).await;
     Ok(())
 }
+

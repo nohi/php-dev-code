@@ -1,0 +1,3587 @@
+diff --git a/server/src/tests/mod.rs b/server/src/tests/mod.rs
+index 122e175..21f59f2 100644
+--- a/server/src/tests/mod.rs
++++ b/server/src/tests/mod.rs
+@@ -6,7 +6,11 @@ use super::{
+         collect_php_files, completion_context_kind, completion_score, extract_local_variables_before_position,
+         detect_undefined_variables,
+         extract_symbols, find_identifier_ranges, identifier_and_range_at_position,
+-        identifier_at_position, is_blade_uri, is_code_position, is_php_uri, is_valid_identifier_name,
++        identifier_and_range_at_position_for_rename,
++        identifier_at_position, is_blade_uri, is_code_position, is_ide_json_uri, is_indexed_uri,
++        is_php_uri, is_phar_uri, is_valid_identifier_name,
++        is_position_within_range,
++        linked_editing_ranges_at_position,
+         import_action_for_fqn,
+         parse_namespace_declaration, parse_single_use_entry, parse_use_aliases,
+         parse_diagnostic_filter_config_text,
+@@ -32,9 +36,26 @@ use super::{
+         extract_laravel_route_names_from_text,
+         extract_php_array_keys,
+         extract_blade_section_names_from_text,
++        extract_blade_attributes_from_text,
++        extract_blade_component_names_from_uri,
++        extract_blade_tag_names_from_text,
++        extract_blade_variables_from_text,
++        blade_view_id_from_uri,
++        collect_blade_view_ids,
++        collect_blade_component_attributes,
++        collect_blade_template_variables,
++        BladeTagContext,
+         extract_phpstorm_meta_override_function_names,
+         laravel_string_completion_context,
+         blade_section_string_completion_context,
++        blade_view_string_completion_context,
++        blade_tag_name_completion_context,
++        blade_component_attribute_completion_context,
++        blade_livewire_value_completion_context,
++        blade_variable_completion_context,
++        infer_livewire_component_class_candidates,
++        extract_livewire_public_members_from_class_text,
++        livewire_lifecycle_method_names,
+         looks_like_blade_template,
+         reference_count_title,
+         reference_locations_for_symbol,
+@@ -44,6 +65,10 @@ use super::{
+         find_use_insertion_position, looks_like_type_name, parse_function_parameters,
+         parse_function_return_type,
+         php_magic_constants,
++        parse_ide_json_entries,
++        normalize_rename_name_after_prepare,
++        sanitize_text_edits_for_document,
++        insert_sanitized_text_edits,
+         symbol_display_name_with_templates,
+         extract_class_relationship_targets,
+         detect_http_urls,
+@@ -96,15 +121,21 @@ use super::{
+         CompletionContextKind, NamespaceDeclaration, PhpSymbol, SymbolKind,
+     };
+     use std::collections::{BTreeMap, HashMap, HashSet};
+-    use std::sync::{Arc, Mutex};
++    use std::sync::{Arc, Mutex, OnceLock};
+     use std::path::Path;
+     use tokio::sync::RwLock;
+     use serde_json::json;
+     use tower_lsp::{LanguageServer, LspService};
+     use tower_lsp::lsp_types::{
+         CodeActionOrCommand, CompletionItem, CompletionItemKind, CompletionParams, Diagnostic, DiagnosticSeverity, InlayHintLabel,
++        HoverParams,
++        LinkedEditingRangeParams,
++        PrepareRenameResponse,
+         Position, Range,
++        RenameParams,
++        TextEdit,
+         TextDocumentIdentifier, TextDocumentPositionParams,
++        WorkspaceSymbolParams,
+         Url,
+     };
+ 
+@@ -272,6 +303,37 @@ use super::{
+         assert_eq!(range.start.character, 0);
+     }
+ 
++    #[test]
++    fn prepare_rename_accepts_identifier_end_boundary_cursor() {
++        let source = "<?php\nrun_test();\n";
++        assert!(identifier_and_range_at_position_for_rename(source, Position::new(1, 1)).is_some());
++        assert!(identifier_and_range_at_position_for_rename(source, Position::new(1, 8)).is_some());
++    }
++
++    #[test]
++    fn normalizes_rename_name_when_client_already_applied_linked_editing_suffix() {
++        assert_eq!(
++            normalize_rename_name_after_prepare("$arg", "$argA", "$argAA"),
++            "$argA"
++        );
++        assert_eq!(
++            normalize_rename_name_after_prepare("$arg", "$argA", "$argA"),
++            "$argA"
++        );
++        assert_eq!(
++            normalize_rename_name_after_prepare("$arg", "$arg", "$argA"),
++            "$argA"
++        );
++    }
++
++    #[test]
++    fn range_membership_uses_exclusive_end_position() {
++        let range = Range::new(Position::new(2, 4), Position::new(2, 8));
++        assert!(is_position_within_range(Position::new(2, 4), range));
++        assert!(is_position_within_range(Position::new(2, 7), range));
++        assert!(!is_position_within_range(Position::new(2, 8), range));
++    }
++
+     #[test]
+     fn finds_identifier_occurrences_with_boundaries() {
+         let source = "<?php\nrun_test();\nrun_test;\nrun_test_extra();";
+@@ -294,891 +356,2300 @@ use super::{
+     }
+ 
+     #[test]
+-    fn validates_php_identifier_names() {
+-        assert!(is_valid_identifier_name("RenamedValue"));
+-        assert!(is_valid_identifier_name("$renamed_value"));
+-        assert!(!is_valid_identifier_name(""));
+-        assert!(!is_valid_identifier_name("123abc"));
+-        assert!(!is_valid_identifier_name("invalid-name"));
++    fn returns_linked_editing_ranges_for_variable_identifier() {
++        let source = "<?php\n$name = 'a';\necho $name;\n$name = strtoupper($name);";
++        let ranges = linked_editing_ranges_at_position(source, Position::new(1, 2));
++        let Some(ranges) = ranges else {
++            panic!("expected linked editing ranges for variable");
++        };
++        assert_eq!(ranges.len(), 4);
+     }
+ 
+     #[test]
+-    fn rejects_comment_and_string_positions_as_code() {
+-        let source = "<?php\nrun_test();\n// run_test\n$text = \"run_test\";";
+-        assert!(is_code_position(source, Position::new(1, 2)));
+-        assert!(!is_code_position(source, Position::new(2, 4)));
+-        assert!(!is_code_position(source, Position::new(3, 10)));
++    fn returns_no_linked_editing_ranges_for_non_variable_or_non_code_position() {
++        let source = "<?php\nrun_test();\n// $name\n$text = \"$name\";\n$name = 1;";
++        assert!(linked_editing_ranges_at_position(source, Position::new(1, 2)).is_none());
++        assert!(linked_editing_ranges_at_position(source, Position::new(2, 4)).is_none());
++        assert!(linked_editing_ranges_at_position(source, Position::new(3, 10)).is_none());
+     }
+ 
+     #[test]
+-    fn skips_common_large_directories() {
+-        assert!(should_skip_dir(Path::new("vendor")));
+-        assert!(should_skip_dir(Path::new("node_modules")));
+-        assert!(should_skip_dir(Path::new(".git")));
+-        assert!(!should_skip_dir(Path::new("app")));
++    fn returns_no_linked_editing_ranges_for_builtin_or_future_variables() {
++        let with_builtin = "<?php\nfunction run(): void {\n    echo $this;\n    echo $_GET['id'] ?? '';\n}\n";
++        assert!(linked_editing_ranges_at_position(with_builtin, Position::new(2, 10)).is_none());
++        assert!(linked_editing_ranges_at_position(with_builtin, Position::new(3, 10)).is_none());
++
++        let declared_later = "<?php\nfunction run(): void {\n    echo $later;\n    $later = 1;\n}\n";
++        assert!(linked_editing_ranges_at_position(declared_later, Position::new(2, 10)).is_none());
+     }
+ 
+-    #[test]
+-    fn collects_php_files_recursively() {
+-        let root = std::env::temp_dir().join("vscode_ls_php_collect_files_test");
+-        let _ = std::fs::remove_dir_all(&root);
+-        std::fs::create_dir_all(root.join("src")).expect("create src dir");
+-        std::fs::create_dir_all(root.join("vendor")).expect("create vendor dir");
+-        std::fs::write(root.join("src").join("a.php"), "<?php").expect("write php");
+-        std::fs::write(root.join("src").join("b.txt"), "x").expect("write txt");
+-        std::fs::write(root.join("vendor").join("c.php"), "<?php").expect("write vendor php");
++    #[tokio::test]
++    async fn linked_editing_range_returns_variable_occurrences_for_document() {
++        let captured_client = Arc::new(Mutex::new(None));
++        let captured_client_for_service = Arc::clone(&captured_client);
++        let (_service, _socket) = LspService::new(move |client| {
++            *captured_client_for_service
++                .lock()
++                .expect("client mutex") = Some(client.clone());
++            Backend {
++                client,
++                documents: RwLock::new(HashMap::new()),
++                symbols: RwLock::new(HashMap::new()),
++                workspace_folders: RwLock::new(Vec::new()),
++                open_documents: RwLock::new(HashSet::new()),
++                rename_prepare_contexts: RwLock::new(HashMap::new()),
++            }
++        });
+ 
+-        let mut out = Vec::new();
+-        collect_php_files(&root, &mut out);
++        let client = captured_client
++            .lock()
++            .expect("client mutex")
++            .take()
++            .expect("captured client");
++        let backend = Backend {
++            client,
++            documents: RwLock::new(HashMap::new()),
++            symbols: RwLock::new(HashMap::new()),
++            workspace_folders: RwLock::new(Vec::new()),
++            open_documents: RwLock::new(HashSet::new()),
++                rename_prepare_contexts: RwLock::new(HashMap::new()),
++        };
+ 
+-        assert_eq!(out.len(), 1);
+-        assert!(out[0].ends_with(Path::new("src").join("a.php")));
++        let uri = Url::parse("file:///tmp/linked-editing.php").expect("uri");
++        backend
++            .update_document(
++                uri.clone(),
++                "<?php\n$name = 1;\necho $name;\n$name += 1;\n".to_string(),
++            )
++            .await;
+ 
+-        let _ = std::fs::remove_dir_all(&root);
+-    }
++        let result = backend
++            .linked_editing_range(LinkedEditingRangeParams {
++                text_document_position_params: TextDocumentPositionParams {
++                    text_document: TextDocumentIdentifier { uri },
++                    position: Position::new(1, 2),
++                },
++                work_done_progress_params: Default::default(),
++            })
++            .await
++            .expect("linked editing result")
++            .expect("linked editing ranges");
+ 
+-    #[test]
+-    fn detects_php_uri_by_extension() {
+-        let php = Url::parse("file:///tmp/test.php").expect("url");
+-        let blade = Url::parse("file:///tmp/index.blade.php").expect("url");
+-        let txt = Url::parse("file:///tmp/test.txt").expect("url");
+-        assert!(is_php_uri(&php));
+-        assert!(is_php_uri(&blade));
+-        assert!(is_blade_uri(&blade));
+-        assert!(!is_php_uri(&txt));
++        assert_eq!(result.ranges.len(), 3);
+     }
+ 
+-    #[test]
+-    fn detects_laravel_route_name_literals() {
+-        let source = "<?php\nRoute::get('/home', HomeController::class)->name('home');\nRoute::post('/login', AuthController::class)->name(\"auth.login\");\n";
+-        let names = extract_laravel_route_names_from_text(source);
+-        assert!(names.contains("home"));
+-        assert!(names.contains("auth.login"));
+-    }
++    #[tokio::test]
++    async fn rename_avoids_double_append_after_linked_editing_document_update() {
++        let captured_client = Arc::new(Mutex::new(None));
++        let captured_client_for_service = Arc::clone(&captured_client);
++        let (_service, _socket) = LspService::new(move |client| {
++            *captured_client_for_service
++                .lock()
++                .expect("client mutex") = Some(client.clone());
++            Backend {
++                client,
++                documents: RwLock::new(HashMap::new()),
++                symbols: RwLock::new(HashMap::new()),
++                workspace_folders: RwLock::new(Vec::new()),
++                open_documents: RwLock::new(HashSet::new()),
++                rename_prepare_contexts: RwLock::new(HashMap::new()),
++            }
++        });
+ 
+-    #[test]
+-    fn extracts_php_array_keys_for_config_candidates() {
+-        let source = "<?php\nreturn [\n  'name' => 'demo',\n  'timezone' => 'UTC',\n  'nested' => [\n    'driver' => 'redis'\n  ],\n];\n";
+-        let keys = extract_php_array_keys(source);
+-        assert!(keys.contains("name"));
+-        assert!(keys.contains("timezone"));
+-        assert!(keys.contains("nested"));
+-        assert!(keys.contains("driver"));
+-    }
++        let client = captured_client
++            .lock()
++            .expect("client mutex")
++            .take()
++            .expect("captured client");
++        let backend = Backend {
++            client,
++            documents: RwLock::new(HashMap::new()),
++            symbols: RwLock::new(HashMap::new()),
++            workspace_folders: RwLock::new(Vec::new()),
++            open_documents: RwLock::new(HashSet::new()),
++            rename_prepare_contexts: RwLock::new(HashMap::new()),
++        };
+ 
+-    #[test]
+-    fn detects_route_and_config_string_completion_context() {
+-        let route_source = "<?php\nroute('home');\n";
+-        let route_ctx = laravel_string_completion_context(route_source, Position::new(1, 10), "route");
+-        assert_eq!(route_ctx, Some('\''));
++        let uri = Url::parse("file:///tmp/rename-linked-editing.php").expect("uri");
++        backend
++            .update_document(
++                uri.clone(),
++                "<?php\nfunction demo($arg) {\n    return $arg;\n}\n".to_string(),
++            )
++            .await;
+ 
+-        let config_source = "<?php\nconfig(\"app.name\");\n";
+-        let config_ctx = laravel_string_completion_context(config_source, Position::new(1, 12), "config");
+-        assert_eq!(config_ctx, Some('"'));
+-    }
++        let prepare = backend
++            .prepare_rename(TextDocumentPositionParams {
++                text_document: TextDocumentIdentifier { uri: uri.clone() },
++                position: Position::new(1, 16),
++            })
++            .await
++            .expect("prepare rename result")
++            .expect("prepare rename response");
++        let prepared_range = match prepare {
++            PrepareRenameResponse::RangeWithPlaceholder { range, .. } => range,
++            PrepareRenameResponse::Range(range) => range,
++            PrepareRenameResponse::DefaultBehavior { default_behavior: _ } => {
++                panic!("expected explicit prepare rename range")
++            }
++        };
++        assert_eq!(prepared_range.start, Position::new(1, 14));
++        assert_eq!(prepared_range.end, Position::new(1, 18));
+ 
+-    #[test]
+-    fn detects_blade_section_string_completion_context() {
+-        let source = "@extends('layouts.app')\n@section('cont')\n";
+-        let section_ctx = blade_section_string_completion_context(source, Position::new(1, 14));
+-        assert_eq!(section_ctx, Some('\''));
++        backend
++            .update_document(
++                uri.clone(),
++                "<?php\nfunction demo($argA) {\n    return $argA;\n}\n".to_string(),
++            )
++            .await;
+ 
+-        let source2 = "@yield(\"header\")\n";
+-        let yield_ctx = blade_section_string_completion_context(source2, Position::new(0, 11));
+-        assert_eq!(yield_ctx, Some('"'));
+-    }
++        let edit = backend
++            .rename(RenameParams {
++                text_document_position: TextDocumentPositionParams {
++                    text_document: TextDocumentIdentifier { uri: uri.clone() },
++                    position: Position::new(1, 17),
++                },
++                new_name: "$argAA".to_string(),
++                work_done_progress_params: Default::default(),
++            })
++            .await
++            .expect("rename result")
++            .expect("workspace edit");
+ 
+-    #[test]
+-    fn extracts_blade_section_names_from_yield_and_section() {
+-        let source = "@yield('content')\n@section(\"header\")\n";
+-        let names = extract_blade_section_names_from_text(source);
+-        assert!(names.contains("content"));
+-        assert!(names.contains("header"));
++        assert!(edit.changes.is_none());
++        assert!(edit.document_changes.is_none());
+     }
+ 
+-    #[test]
+-    fn detects_blade_template_heuristics() {
+-        let blade = "@extends('layouts.app')\n@section('content')\n{{ $slot }}\n@endsection\n";
+-        assert!(looks_like_blade_template(blade));
+-
+-        let php = "<?php\nfunction run() { return 1; }\n";
+-        assert!(!looks_like_blade_template(php));
+-    }
++    #[tokio::test]
++    async fn prepare_rename_rejects_parenthesis_position() {
++        let captured_client = Arc::new(Mutex::new(None));
++        let captured_client_for_service = Arc::clone(&captured_client);
++        let (_service, _socket) = LspService::new(move |client| {
++            *captured_client_for_service
++                .lock()
++                .expect("client mutex") = Some(client.clone());
++            Backend {
++                client,
++                documents: RwLock::new(HashMap::new()),
++                symbols: RwLock::new(HashMap::new()),
++                workspace_folders: RwLock::new(Vec::new()),
++                open_documents: RwLock::new(HashSet::new()),
++                rename_prepare_contexts: RwLock::new(HashMap::new()),
++            }
++        });
+ 
+-    #[test]
+-    fn formats_blade_directive_spacing() {
+-        assert_eq!(format_blade_directive_spacing("@if($a)"), "@if ($a)");
+-        assert_eq!(format_blade_directive_spacing("@foreach($items as $item)"), "@foreach ($items as $item)");
+-    }
++        let client = captured_client
++            .lock()
++            .expect("client mutex")
++            .take()
++            .expect("captured client");
++        let backend = Backend {
++            client,
++            documents: RwLock::new(HashMap::new()),
++            symbols: RwLock::new(HashMap::new()),
++            workspace_folders: RwLock::new(Vec::new()),
++            open_documents: RwLock::new(HashSet::new()),
++            rename_prepare_contexts: RwLock::new(HashMap::new()),
++        };
+ 
+-    #[test]
+-    fn format_document_applies_blade_directive_spacing() {
+-        let source = "@if($ready)\n<div>ok</div>\n@endif\n";
+-        let formatted = format_document(source);
+-        assert!(formatted.starts_with("@if ($ready)\n"));
+-    }
++        let uri = Url::parse("file:///tmp/prepare-rename-invalid.php").expect("uri");
++        backend
++            .update_document(uri.clone(), "<?php\nrun_test();\n".to_string())
++            .await;
+ 
+-    #[test]
+-    fn tokenizes_blade_directive_as_semantic_function_token() {
+-        let source = "@if ($ok)\n<div>{{ $ok }}</div>\n@endif\n";
+-        let tokens = tokenize_php_document(source);
+-        assert!(tokens.iter().any(|t| t.line == 0 && t.char == 0 && t.token_type == 1));
++        let result = backend
++            .prepare_rename(TextDocumentPositionParams {
++                text_document: TextDocumentIdentifier { uri },
++                position: Position::new(1, 9),
++            })
++            .await
++            .expect("prepare rename result");
++        assert!(result.is_none());
+     }
+ 
+-    #[test]
+-    fn tokenizes_html_tags_in_template() {
+-        let source = "<section>\n  <div class=\"x\"></div>\n</section>\n";
+-        let tokens = tokenize_php_document(source);
+-        assert!(tokens.iter().any(|t| t.line == 0 && t.char == 1 && t.token_type == 5));
+-        assert!(tokens.iter().any(|t| t.line == 1 && t.char == 3 && t.token_type == 5));
+-    }
++    #[tokio::test]
++    async fn rename_at_identifier_end_boundary_generates_edits() {
++        let captured_client = Arc::new(Mutex::new(None));
++        let captured_client_for_service = Arc::clone(&captured_client);
++        let (_service, _socket) = LspService::new(move |client| {
++            *captured_client_for_service
++                .lock()
++                .expect("client mutex") = Some(client.clone());
++            Backend {
++                client,
++                documents: RwLock::new(HashMap::new()),
++                symbols: RwLock::new(HashMap::new()),
++                workspace_folders: RwLock::new(Vec::new()),
++                open_documents: RwLock::new(HashSet::new()),
++                rename_prepare_contexts: RwLock::new(HashMap::new()),
++            }
++        });
+ 
+-    #[test]
+-    fn tokenizes_embedded_js_and_css_keywords_in_template() {
+-        let source = "<script>\nconst value = 1;\nfunction run() { return value; }\n</script>\n<style>\ncolor: red;\nmargin-top: 4px;\n</style>\n";
+-        let tokens = tokenize_php_document(source);
+-        assert!(tokens.iter().any(|t| t.line == 1 && t.token_type == 1));
+-        assert!(tokens.iter().any(|t| t.line == 2 && t.token_type == 1));
+-        assert!(tokens.iter().any(|t| t.line == 5 && t.token_type == 0));
+-        assert!(tokens.iter().any(|t| t.line == 6 && t.token_type == 0));
+-    }
+-
+-    #[test]
+-    fn scores_local_function_higher_than_keyword() {
+-        let function_score = completion_score(
+-            "run_test",
+-            "run",
+-            true,
+-            Some(CompletionItemKind::FUNCTION),
+-            CompletionContextKind::General,
+-        );
+-        let keyword_score = completion_score(
+-            "return",
+-            "re",
+-            false,
+-            Some(CompletionItemKind::KEYWORD),
+-            CompletionContextKind::General,
+-        );
+-        assert!(function_score > keyword_score);
+-    }
+-
+-    #[test]
+-    fn includes_magic_constants_in_completion_keywords() {
+-        let constants = php_magic_constants();
+-        assert!(constants.contains(&"__FILE__"));
+-        assert!(constants.contains(&"__DIR__"));
+-        assert!(constants.contains(&"__NAMESPACE__"));
+-    }
++        let client = captured_client
++            .lock()
++            .expect("client mutex")
++            .take()
++            .expect("captured client");
++        let backend = Backend {
++            client,
++            documents: RwLock::new(HashMap::new()),
++            symbols: RwLock::new(HashMap::new()),
++            workspace_folders: RwLock::new(Vec::new()),
++            open_documents: RwLock::new(HashSet::new()),
++            rename_prepare_contexts: RwLock::new(HashMap::new()),
++        };
+ 
+-    #[test]
+-    fn detects_use_statement_completion_context() {
+-        let source = "<?php\nuse App\\";
+-        let context = completion_context_kind(source, Position::new(1, 8));
+-        assert!(matches!(context, CompletionContextKind::UseStatement));
+-    }
++        let uri = Url::parse("file:///tmp/rename-method-boundary.php").expect("uri");
++        backend
++            .update_document(
++                uri.clone(),
++                "<?php\nclass C {\n    public function registertesttest() {}\n    public function boot(): void {\n        $this->registertesttest();\n    }\n}\n"
++                    .to_string(),
++            )
++            .await;
+ 
+-    #[test]
+-    fn parses_namespace_declaration() {
+-        let ns = parse_namespace_declaration("namespace App\\Domain\\Auth;");
+-        assert!(matches!(
+-            ns,
+-            Some(NamespaceDeclaration::Inline(value)) if value == "App\\Domain\\Auth"
+-        ));
++        let prepare = backend
++            .prepare_rename(TextDocumentPositionParams {
++                text_document: TextDocumentIdentifier { uri: uri.clone() },
++                position: Position::new(2, 36),
++            })
++            .await
++            .expect("prepare rename result");
++        let Some(PrepareRenameResponse::RangeWithPlaceholder { placeholder, .. }) = prepare else {
++            panic!("expected prepare rename placeholder")
++        };
++        assert_eq!(placeholder, "registertesttest");
+ 
+-        let block = parse_namespace_declaration("namespace App\\Domain { ");
+-        assert!(matches!(
+-            block,
+-            Some(NamespaceDeclaration::Block(value)) if value == "App\\Domain"
+-        ));
++        let edit = backend
++            .rename(RenameParams {
++                text_document_position: TextDocumentPositionParams {
++                    text_document: TextDocumentIdentifier { uri: uri.clone() },
++                    position: Position::new(2, 36),
++                },
++                new_name: "registertesttestA".to_string(),
++                work_done_progress_params: Default::default(),
++            })
++            .await
++            .expect("rename result")
++            .expect("workspace edit");
+ 
+-        let global = parse_namespace_declaration("namespace;");
+-        assert!(matches!(global, Some(NamespaceDeclaration::Global)));
++        let changes = edit.changes.expect("changes map");
++        let edits = changes.get(&uri).expect("document edits");
++        assert!(!edits.is_empty(), "rename at identifier end should produce edits");
++        assert!(
++            edits.iter().all(|e| e.new_text == "registertesttestA"),
++            "rename should apply requested name on boundary cursor"
++        );
+     }
+ 
+-    #[test]
+-    fn uses_fqn_label_in_use_context() {
+-        let source = "<?php\nnamespace App\\Models;\nclass User {}";
+-        let symbols = extract_symbols(source);
+-        let user = symbols.iter().find(|s| s.name == "User").expect("user symbol");
+-
+-        let label = symbol_completion_label(user, CompletionContextKind::UseStatement);
+-        assert_eq!(label, "App\\Models\\User");
+-    }
++    #[tokio::test]
++    async fn rename_boundary_normalizes_duplicate_append_from_linked_editing_update() {
++        let captured_client = Arc::new(Mutex::new(None));
++        let captured_client_for_service = Arc::clone(&captured_client);
++        let (_service, _socket) = LspService::new(move |client| {
++            *captured_client_for_service
++                .lock()
++                .expect("client mutex") = Some(client.clone());
++            Backend {
++                client,
++                documents: RwLock::new(HashMap::new()),
++                symbols: RwLock::new(HashMap::new()),
++                workspace_folders: RwLock::new(Vec::new()),
++                open_documents: RwLock::new(HashSet::new()),
++                rename_prepare_contexts: RwLock::new(HashMap::new()),
++            }
++        });
+ 
+-    #[test]
+-    fn parses_use_aliases_and_resolves_alias_query() {
+-        let source = "<?php\nnamespace App\\Http\\Controllers;\nuse App\\Models\\User as AppUser;\n";
+-        let aliases = parse_use_aliases(source);
+-        assert_eq!(aliases.get("AppUser"), Some(&"App\\Models\\User".to_string()));
++        let client = captured_client
++            .lock()
++            .expect("client mutex")
++            .take()
++            .expect("captured client");
++        let backend = Backend {
++            client,
++            documents: RwLock::new(HashMap::new()),
++            symbols: RwLock::new(HashMap::new()),
++            workspace_folders: RwLock::new(Vec::new()),
++            open_documents: RwLock::new(HashSet::new()),
++            rename_prepare_contexts: RwLock::new(HashMap::new()),
++        };
+ 
+-        let queries = resolve_symbol_queries(source, Position::new(2, 1), "AppUser");
+-        assert_eq!(queries.first(), Some(&"App\\Models\\User".to_string()));
+-        assert!(queries.contains(&"App\\Models\\User".to_string()));
+-    }
++        let uri = Url::parse("file:///tmp/rename-method-boundary-linked.php").expect("uri");
++        backend
++            .update_document(
++                uri.clone(),
++                "<?php\nclass C {\n    public function registertesttest() {}\n    public function boot(): void {\n        $this->registertesttest();\n    }\n}\n"
++                    .to_string(),
++            )
++            .await;
+ 
+-    #[test]
+-    fn ignores_closure_use_syntax_when_parsing_aliases() {
+-        let source = "<?php\n$fn = function() use($user) { return $user; };\nuse App\\Models\\User;";
+-        let aliases = parse_use_aliases(source);
+-        assert_eq!(aliases.get("User"), Some(&"App\\Models\\User".to_string()));
+-        assert_eq!(aliases.len(), 1);
+-    }
++        let _prepare = backend
++            .prepare_rename(TextDocumentPositionParams {
++                text_document: TextDocumentIdentifier { uri: uri.clone() },
++                position: Position::new(2, 36),
++            })
++            .await
++            .expect("prepare rename result")
++            .expect("prepare rename response");
+ 
+-    #[test]
+-    fn parses_group_use_aliases() {
+-        let source = "<?php\nuse App\\Models\\{User, Post as BlogPost};\n";
+-        let aliases = parse_use_aliases(source);
+-        assert_eq!(aliases.get("User"), Some(&"App\\Models\\User".to_string()));
+-        assert_eq!(aliases.get("BlogPost"), Some(&"App\\Models\\Post".to_string()));
+-    }
++        backend
++            .update_document(
++                uri.clone(),
++                "<?php\nclass C {\n    public function registertesttestA() {}\n    public function boot(): void {\n        $this->registertesttestA();\n    }\n}\n"
++                    .to_string(),
++            )
++            .await;
+ 
+-    #[test]
+-    fn splits_use_entries_at_top_level_commas() {
+-        let entries = split_use_entries("App\\A, App\\B\\{C, D as E}, App\\F");
+-        assert_eq!(entries.len(), 3);
+-        assert_eq!(entries[1], "App\\B\\{C, D as E}");
++        let edit = backend
++            .rename(RenameParams {
++                text_document_position: TextDocumentPositionParams {
++                    text_document: TextDocumentIdentifier { uri: uri.clone() },
++                    position: Position::new(2, 37),
++                },
++                new_name: "registertesttestAA".to_string(),
++                work_done_progress_params: Default::default(),
++            })
++            .await
++            .expect("rename result")
++            .expect("workspace edit");
++        assert!(edit.changes.is_none(), "normalized duplicate append should become no-op");
++        assert!(edit.document_changes.is_none());
+     }
+ 
+     #[test]
+-    fn parses_single_use_entry_alias() {
+-        let mut aliases = HashMap::new();
+-        parse_single_use_entry("App\\Support\\Str as StringHelper", &mut aliases);
++    fn normalizes_rename_name_for_method_linked_editing_suffix() {
+         assert_eq!(
+-            aliases.get("StringHelper"),
+-            Some(&"App\\Support\\Str".to_string())
++            normalize_rename_name_after_prepare(
++                "registertesttest",
++                "registertesttestA",
++                "registertesttestAA"
++            ),
++            "registertesttestA"
+         );
+     }
+ 
+     #[test]
+-    fn builds_search_terms_for_target_from_document_context() {
+-        let source = "<?php\nnamespace App\\Http;\nuse App\\Models\\User as AppUser;\n";
+-        let terms = search_terms_for_target_in_document("App\\Models\\User", source, true);
+-        assert!(terms.contains(&"AppUser".to_string()));
+-        assert!(terms.contains(&"App\\Models\\User".to_string()));
+-        assert!(terms.contains(&"\\App\\Models\\User".to_string()));
++    fn sanitize_text_edits_removes_invalid_and_overlapping_and_sorts_descending() {
++        let text = "<?php\n$abc = 1;\n$abc = $abc + 1;\n";
++        let edits = vec![
++            TextEdit {
++                range: Range::new(Position::new(1, 0), Position::new(1, 4)),
++                new_text: "$name".to_string(),
++            },
++            TextEdit {
++                range: Range::new(Position::new(1, 0), Position::new(1, 2)),
++                new_text: "$n".to_string(),
++            },
++            TextEdit {
++                range: Range::new(Position::new(2, 7), Position::new(2, 11)),
++                new_text: "$name".to_string(),
++            },
++            TextEdit {
++                range: Range::new(Position::new(2, 30), Position::new(2, 35)),
++                new_text: "$bad".to_string(),
++            },
++        ];
++
++        let sanitized = sanitize_text_edits_for_document(text, edits);
++        assert_eq!(sanitized.len(), 2);
++        assert_eq!(sanitized[0].range, Range::new(Position::new(2, 7), Position::new(2, 11)));
++        assert_eq!(sanitized[1].range, Range::new(Position::new(1, 0), Position::new(1, 4)));
+     }
+ 
+     #[test]
+-    fn builds_search_terms_for_group_use_aliases() {
+-        let source = "<?php\nuse App\\Models\\{User as AppUser, Post};\n";
++    fn insert_sanitized_text_edits_skips_empty_sanitized_results() {
++        let uri = Url::parse("file:///tmp/rename-empty-edits.php").expect("uri");
++        let text = "<?php\n$value = 1;\n";
++        let invalid_only = vec![TextEdit {
++            range: Range::new(Position::new(5, 0), Position::new(5, 5)),
++            new_text: "$renamed".to_string(),
++        }];
+ 
+-        let terms_for_refs = search_terms_for_target_in_document("App\\Models\\User", source, true);
+-        assert!(terms_for_refs.contains(&"AppUser".to_string()));
++        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
++        insert_sanitized_text_edits(&mut changes, uri, text, invalid_only);
+ 
+-        let terms_for_rename = search_terms_for_target_in_document("App\\Models\\User", source, false);
+-        assert!(!terms_for_rename.contains(&"AppUser".to_string()));
+-        assert!(terms_for_rename.contains(&"App\\Models\\User".to_string()));
++        assert!(changes.is_empty(), "documents with no valid edits must not be inserted");
+     }
+ 
+     #[test]
+-    fn splits_fqn_into_namespace_and_short_name() {
+-        let (ns, short) = split_fqn("App\\Models\\User");
+-        assert_eq!(ns.as_deref(), Some("App\\Models"));
+-        assert_eq!(short, "User");
++    fn validates_php_identifier_names() {
++        assert!(is_valid_identifier_name("RenamedValue"));
++        assert!(is_valid_identifier_name("$renamed_value"));
++        assert!(!is_valid_identifier_name(""));
++        assert!(!is_valid_identifier_name("123abc"));
++        assert!(!is_valid_identifier_name("invalid-name"));
+     }
+ 
+     #[test]
+-    fn detects_type_like_names() {
+-        assert!(looks_like_type_name("User"));
+-        assert!(looks_like_type_name("_InternalType"));
+-        assert!(!looks_like_type_name("user"));
+-        assert!(!looks_like_type_name("$User"));
++    fn rejects_comment_and_string_positions_as_code() {
++        let source = "<?php\nrun_test();\n// run_test\n$text = \"run_test\";";
++        assert!(is_code_position(source, Position::new(1, 2)));
++        assert!(!is_code_position(source, Position::new(2, 4)));
++        assert!(!is_code_position(source, Position::new(3, 10)));
+     }
+ 
+     #[test]
+-    fn computes_use_insertion_position() {
+-        let source = "<?php\nnamespace App\\Http;\nuse App\\Models\\Post;\nclass C {}";
+-        let pos = find_use_insertion_position(source);
+-        assert_eq!(pos.line, 3);
+-        assert_eq!(pos.character, 0);
++    fn skips_common_large_directories() {
++        assert!(should_skip_dir(Path::new("vendor")));
++        assert!(should_skip_dir(Path::new("node_modules")));
++        assert!(should_skip_dir(Path::new(".git")));
++        assert!(!should_skip_dir(Path::new("app")));
+     }
+ 
+     #[test]
+-    fn matches_symbol_with_fqn_query() {
+-        let symbol = PhpSymbol {
+-            name: "User".to_string(),
+-            namespace: Some("App\\Models".to_string()),
+-            kind: SymbolKind::CLASS,
+-            parameters: Vec::new(),
+-            return_type: None,
+-            range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+-        };
++    fn collects_php_files_recursively() {
++        let root = std::env::temp_dir().join("vscode_ls_php_collect_files_test");
++        let _ = std::fs::remove_dir_all(&root);
++        std::fs::create_dir_all(root.join("src")).expect("create src dir");
++        std::fs::create_dir_all(root.join("vendor")).expect("create vendor dir");
++        std::fs::write(root.join("src").join("a.php"), "<?php").expect("write php");
++        std::fs::write(root.join("src").join("b.txt"), "x").expect("write txt");
++        std::fs::write(root.join("vendor").join("c.php"), "<?php").expect("write vendor php");
+ 
+-        assert!(symbol_matches_query(&symbol, "App\\Models\\User"));
+-        assert!(symbol_matches_query(&symbol, "User"));
+-        assert!(!symbol_matches_query(&symbol, "App\\Models\\Order"));
++        let mut out = Vec::new();
++        collect_php_files(&root, &mut out);
++
++        assert_eq!(out.len(), 1);
++        assert!(out[0].ends_with(Path::new("src").join("a.php")));
++
++        let _ = std::fs::remove_dir_all(&root);
+     }
+ 
+     #[test]
+-    fn recognizes_type_symbol_kinds() {
+-        assert!(is_type_symbol_kind(SymbolKind::CLASS));
+-        assert!(is_type_symbol_kind(SymbolKind::INTERFACE));
+-        assert!(is_type_symbol_kind(SymbolKind::ENUM));
+-        assert!(!is_type_symbol_kind(SymbolKind::FUNCTION));
++    fn detects_php_uri_by_extension() {
++        let php = Url::parse("file:///tmp/test.php").expect("url");
++        let blade = Url::parse("file:///tmp/index.blade.php").expect("url");
++        let ide = Url::parse("file:///tmp/ide.json").expect("url");
++        let phar_scheme_php = Url::parse("phar:///tmp/app.phar/src/Test.php").expect("url");
++        let phar_scheme_blade = Url::parse("phar:///tmp/app.phar/resources/index.blade.php").expect("url");
++        let file_phar_segment_php = Url::parse("file:///tmp/vendor/app.phar/src/Test.php").expect("url");
++        let non_file_phar_like_php = Url::parse("zip:///tmp/vendor/app.phar/src/Test.php").expect("url");
++        let non_file_phar_like_text = Url::parse("zip:///tmp/vendor/app.phar/docs/readme.txt").expect("url");
++        let txt = Url::parse("file:///tmp/test.txt").expect("url");
++        assert!(is_php_uri(&php));
++        assert!(is_php_uri(&blade));
++        assert!(is_php_uri(&phar_scheme_php));
++        assert!(is_php_uri(&phar_scheme_blade));
++        assert!(is_php_uri(&file_phar_segment_php));
++        assert!(is_php_uri(&non_file_phar_like_php));
++        assert!(is_phar_uri(&phar_scheme_php));
++        assert!(is_phar_uri(&file_phar_segment_php));
++        assert!(!is_phar_uri(&non_file_phar_like_php));
++        assert!(!is_phar_uri(&non_file_phar_like_text));
++        assert!(!is_php_uri(&non_file_phar_like_text));
++        assert!(is_blade_uri(&blade));
++        assert!(is_ide_json_uri(&ide));
++        assert!(is_indexed_uri(&php));
++        assert!(is_indexed_uri(&phar_scheme_php));
++        assert!(is_indexed_uri(&ide));
++        assert!(!is_php_uri(&txt));
++        assert!(!is_phar_uri(&txt));
++        assert!(!is_indexed_uri(&txt));
+     }
+ 
+-    #[test]
+-    fn finds_type_definition_from_current_document() {
+-        let current_uri = Url::parse("file:///tmp/current.php").expect("current uri");
+-        let index = HashMap::from([(
+-            current_uri.clone(),
+-            vec![PhpSymbol {
+-                name: "User".to_string(),
+-                namespace: Some("App\\Models".to_string()),
+-                kind: SymbolKind::CLASS,
+-                parameters: Vec::new(),
+-                return_type: None,
+-                range: Range::new(Position::new(2, 0), Position::new(2, 4)),
+-            }],
+-        )]);
++    #[tokio::test]
++    async fn phar_document_is_indexed_for_hover_and_workspace_symbol() {
++        let captured_client = Arc::new(Mutex::new(None));
++        let captured_client_for_service = Arc::clone(&captured_client);
++        let (_service, _socket) = LspService::new(move |client| {
++            *captured_client_for_service
++                .lock()
++                .expect("client mutex") = Some(client.clone());
++            Backend {
++                client,
++                documents: RwLock::new(HashMap::new()),
++                symbols: RwLock::new(HashMap::new()),
++                workspace_folders: RwLock::new(Vec::new()),
++                open_documents: RwLock::new(HashSet::new()),
++                rename_prepare_contexts: RwLock::new(HashMap::new()),
++            }
++        });
+ 
+-        let location = find_type_definition_in_index(
+-            &index,
+-            &current_uri,
+-            &["App\\Models\\User".to_string()],
+-        )
+-        .expect("location");
+-        assert_eq!(location.uri, current_uri);
+-        assert_eq!(location.range.start, Position::new(2, 0));
+-    }
++        let client = captured_client
++            .lock()
++            .expect("client mutex")
++            .take()
++            .expect("captured client");
++        let backend = Backend {
++            client,
++            documents: RwLock::new(HashMap::new()),
++            symbols: RwLock::new(HashMap::new()),
++            workspace_folders: RwLock::new(Vec::new()),
++            open_documents: RwLock::new(HashSet::new()),
++                rename_prepare_contexts: RwLock::new(HashMap::new()),
++        };
+ 
+-    #[test]
+-    fn skips_non_type_symbols_when_finding_type_definition() {
+-        let current_uri = Url::parse("file:///tmp/current.php").expect("current uri");
+-        let external_uri = Url::parse("file:///tmp/external.php").expect("external uri");
+-        let index = HashMap::from([
+-            (
+-                current_uri.clone(),
+-                vec![PhpSymbol {
+-                    name: "User".to_string(),
+-                    namespace: Some("App\\Models".to_string()),
+-                    kind: SymbolKind::FUNCTION,
+-                    parameters: Vec::new(),
+-                    return_type: None,
+-                    range: Range::new(Position::new(1, 0), Position::new(1, 4)),
+-                }],
+-            ),
+-            (
+-                external_uri.clone(),
+-                vec![PhpSymbol {
+-                    name: "User".to_string(),
+-                    namespace: Some("App\\Models".to_string()),
+-                    kind: SymbolKind::CLASS,
+-                    parameters: Vec::new(),
+-                    return_type: None,
+-                    range: Range::new(Position::new(6, 0), Position::new(6, 4)),
+-                }],
+-            ),
+-        ]);
++        let uri = Url::parse("phar:///tmp/vendor/tools.phar/src/ArchiveClass.php").expect("uri");
++        backend
++            .update_document(
++                uri.clone(),
++                "<?php\nclass ArchiveClass {}\nnew ArchiveClass();\n".to_string(),
++            )
++            .await;
+ 
+-        let location =
+-            find_type_definition_in_index(&index, &current_uri, &["User".to_string()]).expect("location");
+-        assert_eq!(location.uri, external_uri);
+-        assert_eq!(location.range.start, Position::new(6, 0));
++        let hover = backend
++            .hover(HoverParams {
++                text_document_position_params: TextDocumentPositionParams {
++                    text_document: TextDocumentIdentifier { uri: uri.clone() },
++                    position: Position::new(2, 5),
++                },
++                work_done_progress_params: Default::default(),
++            })
++            .await
++            .expect("hover result");
++        assert!(hover.is_some());
++
++        let symbols = backend
++            .symbol(WorkspaceSymbolParams {
++                query: "ArchiveClass".to_string(),
++                work_done_progress_params: Default::default(),
++                partial_result_params: Default::default(),
++            })
++            .await
++            .expect("workspace symbols")
++            .unwrap_or_default();
++        assert!(symbols
++            .iter()
++            .any(|item| item.name == "ArchiveClass" && item.location.uri == uri));
+     }
+ 
+     #[test]
+-    fn prefers_current_document_type_definition() {
+-        let current_uri = Url::parse("file:///tmp/current.php").expect("current uri");
+-        let external_uri = Url::parse("file:///tmp/external.php").expect("external uri");
+-        let index = HashMap::from([
+-            (
+-                current_uri.clone(),
+-                vec![PhpSymbol {
+-                    name: "User".to_string(),
+-                    namespace: Some("App\\Models".to_string()),
+-                    kind: SymbolKind::CLASS,
+-                    parameters: Vec::new(),
+-                    return_type: None,
+-                    range: Range::new(Position::new(3, 0), Position::new(3, 4)),
+-                }],
+-            ),
+-            (
+-                external_uri,
+-                vec![PhpSymbol {
+-                    name: "User".to_string(),
+-                    namespace: Some("App\\Models".to_string()),
+-                    kind: SymbolKind::CLASS,
+-                    parameters: Vec::new(),
+-                    return_type: None,
+-                    range: Range::new(Position::new(8, 0), Position::new(8, 4)),
+-                }],
+-            ),
+-        ]);
++    fn parses_ide_json_entries_from_common_shapes() {
++        let parsed = parse_ide_json_entries(
++            r#"{
++  "completions": [" customWord ", "", "anotherWord"],
++  "blade": {
++    "directives": {"customDirective": {}, "@already": {}},
++    "components": ["profile-card", "x-alert", " badge "]
++  }
++}"#,
++        );
++        assert!(parsed.completions.contains(&"customWord".to_string()));
++        assert!(parsed.completions.contains(&"anotherWord".to_string()));
++        assert!(parsed.blade_directives.contains(&"@customDirective".to_string()));
++        assert!(parsed.blade_directives.contains(&"@already".to_string()));
++        assert!(parsed.blade_components.contains(&"profile-card".to_string()));
++        assert!(parsed.blade_components.contains(&"x-profile-card".to_string()));
++        assert!(parsed.blade_components.contains(&"x-alert".to_string()));
++        assert!(parsed.blade_components.contains(&"badge".to_string()));
++        assert!(parsed.blade_components.contains(&"x-badge".to_string()));
++    }
+ 
+-        let location =
+-            find_type_definition_in_index(&index, &current_uri, &["User".to_string()]).expect("location");
+-        assert_eq!(location.uri, current_uri);
+-        assert_eq!(location.range.start, Position::new(3, 0));
++    #[test]
++    fn parses_ide_json_entries_returns_empty_on_invalid_json() {
++        let parsed = parse_ide_json_entries("{invalid-json");
++        assert!(parsed.completions.is_empty());
++        assert!(parsed.blade_directives.is_empty());
++        assert!(parsed.blade_components.is_empty());
+     }
+ 
+     #[test]
+-    fn returns_none_when_type_definition_not_found() {
+-        let current_uri = Url::parse("file:///tmp/current.php").expect("current uri");
+-        let index = HashMap::from([(
+-            current_uri.clone(),
+-            vec![PhpSymbol {
+-                name: "run".to_string(),
+-                namespace: None,
+-                kind: SymbolKind::FUNCTION,
+-                parameters: Vec::new(),
+-                return_type: None,
+-                range: Range::new(Position::new(1, 0), Position::new(1, 3)),
+-            }],
+-        )]);
++    fn parses_ide_json_entries_from_object_maps_and_dedupes() {
++        let parsed = parse_ide_json_entries(
++            r#"{
++  "completions": {"tenantScope": {}, " tenantScope ": {}, "": {}, " secondWord ": {}},
++  "blade": {
++    "directives": ["tenant", " @tenant ", "", "@already"],
++    "components": {"profile-card": {}, " x-profile-card ": {}, "": {}, "x-alert": {}}
++  }
++}"#,
++        );
+ 
+-        let location = find_type_definition_in_index(&index, &current_uri, &["User".to_string()]);
+-        assert!(location.is_none());
++        assert!(parsed.completions.contains(&"tenantScope".to_string()));
++        assert!(parsed.completions.contains(&"secondWord".to_string()));
++        assert!(!parsed.completions.iter().any(|item| item.is_empty()));
++
++        assert!(parsed.blade_directives.contains(&"@tenant".to_string()));
++        assert!(parsed.blade_directives.contains(&"@already".to_string()));
++        assert_eq!(
++            parsed
++                .blade_directives
++                .iter()
++                .filter(|item| item.as_str() == "@tenant")
++                .count(),
++            1
++        );
++
++        assert!(parsed.blade_components.contains(&"profile-card".to_string()));
++        assert!(parsed.blade_components.contains(&"x-profile-card".to_string()));
++        assert!(parsed.blade_components.contains(&"x-alert".to_string()));
++        assert!(!parsed.blade_components.iter().any(|item| item.is_empty()));
+     }
+ 
+     #[test]
+-    fn matches_workspace_symbol_query_by_fqn_and_kind_tokens() {
+-        let symbol = PhpSymbol {
+-            name: "User".to_string(),
+-            namespace: Some("App\\Models".to_string()),
+-            kind: SymbolKind::CLASS,
+-            parameters: Vec::new(),
+-            return_type: None,
+-            range: Range::new(Position::new(0, 0), Position::new(0, 4)),
+-        };
++    fn detects_laravel_route_name_literals() {
++        let source = "<?php\nRoute::get('/home', HomeController::class)->name('home');\nRoute::post('/login', AuthController::class)->name(\"auth.login\");\n";
++        let names = extract_laravel_route_names_from_text(source);
++        assert!(names.contains("home"));
++        assert!(names.contains("auth.login"));
++    }
+ 
+-        assert!(workspace_symbol_matches_query(&symbol, "app\\models class"));
+-        assert!(workspace_symbol_matches_query(&symbol, "user"));
+-        assert!(!workspace_symbol_matches_query(&symbol, "service interface"));
++    #[test]
++    fn extracts_php_array_keys_for_config_candidates() {
++        let source = "<?php\nreturn [\n  'name' => 'demo',\n  'timezone' => 'UTC',\n  'nested' => [\n    'driver' => 'redis'\n  ],\n];\n";
++        let keys = extract_php_array_keys(source);
++        assert!(keys.contains("name"));
++        assert!(keys.contains("timezone"));
++        assert!(keys.contains("nested"));
++        assert!(keys.contains("driver"));
+     }
+ 
+     #[test]
+-    fn matches_workspace_symbol_query_with_empty_input() {
+-        let symbol = PhpSymbol {
+-            name: "run".to_string(),
+-            namespace: None,
+-            kind: SymbolKind::FUNCTION,
+-            parameters: Vec::new(),
+-            return_type: None,
+-            range: Range::new(Position::new(0, 0), Position::new(0, 3)),
+-        };
++    fn detects_route_and_config_string_completion_context() {
++        let route_source = "<?php\nroute('home');\n";
++        let route_ctx = laravel_string_completion_context(route_source, Position::new(1, 10), "route");
++        assert_eq!(route_ctx, Some('\''));
+ 
+-        assert!(workspace_symbol_matches_query(&symbol, ""));
+-        assert!(workspace_symbol_matches_query(&symbol, "   "));
++        let config_source = "<?php\nconfig(\"app.name\");\n";
++        let config_ctx = laravel_string_completion_context(config_source, Position::new(1, 12), "config");
++        assert_eq!(config_ctx, Some('"'));
+     }
+ 
+     #[test]
+-    fn scores_workspace_symbol_higher_for_exact_name_match() {
+-        let exact = PhpSymbol {
+-            name: "User".to_string(),
+-            namespace: Some("App\\Models".to_string()),
+-            kind: SymbolKind::CLASS,
+-            parameters: Vec::new(),
+-            return_type: None,
+-            range: Range::new(Position::new(0, 0), Position::new(0, 4)),
+-        };
+-        let prefix = PhpSymbol {
+-            name: "UserRepository".to_string(),
+-            namespace: Some("App\\Models".to_string()),
+-            kind: SymbolKind::CLASS,
+-            parameters: Vec::new(),
+-            return_type: None,
+-            range: Range::new(Position::new(0, 0), Position::new(0, 13)),
+-        };
++    fn detects_blade_section_string_completion_context() {
++        let source = "@extends('layouts.app')\n@section('cont')\n";
++        let section_ctx = blade_section_string_completion_context(source, Position::new(1, 14));
++        assert_eq!(section_ctx, Some('\''));
+ 
+-        let exact_score = workspace_symbol_score(&exact, "user").expect("exact score");
+-        let prefix_score = workspace_symbol_score(&prefix, "user").expect("prefix score");
+-        assert!(exact_score > prefix_score);
++        let source2 = "@yield(\"header\")\n";
++        let yield_ctx = blade_section_string_completion_context(source2, Position::new(0, 11));
++        assert_eq!(yield_ctx, Some('"'));
+     }
+ 
+     #[test]
+-    fn skips_workspace_symbol_score_when_query_not_matched() {
+-        let symbol = PhpSymbol {
+-            name: "User".to_string(),
+-            namespace: Some("App\\Models".to_string()),
+-            kind: SymbolKind::CLASS,
+-            parameters: Vec::new(),
+-            return_type: None,
+-            range: Range::new(Position::new(0, 0), Position::new(0, 4)),
+-        };
++    fn detects_blade_view_string_completion_context() {
++        let source = "@include('partials.he')\n";
++        let include_ctx = blade_view_string_completion_context(source, Position::new(0, 16));
++        assert_eq!(include_ctx, Some('\''));
+ 
+-        assert!(workspace_symbol_score(&symbol, "invoice").is_none());
++        let source2 = "<?php\nview(\"pages.ho\");\n";
++        let view_ctx = blade_view_string_completion_context(source2, Position::new(1, 13));
++        assert_eq!(view_ctx, Some('"'));
+     }
+ 
+     #[test]
+-    fn detects_call_ranges_for_function_calls_only() {
+-        let source = "<?php\nrun_test($a);\n$run_test = 1;\nrun_test\n";
+-        let ranges = call_ranges_for_name(source, "run_test");
+-        assert_eq!(ranges.len(), 1);
+-        assert_eq!(ranges[0].start, Position::new(1, 0));
++    fn derives_blade_view_id_from_uri() {
++        let uri = Url::parse("file:///tmp/resources/views/admin/users/index.blade.php").expect("uri");
++        assert_eq!(
++            blade_view_id_from_uri(&uri).as_deref(),
++            Some("admin.users.index")
++        );
+     }
+ 
+     #[test]
+-    fn detects_static_member_completion_context() {
+-        let source = "<?php\nUser::get";
+-        let context = static_member_completion_context(source, Position::new(1, 9));
+-        assert_eq!(context.as_deref(), Some("User"));
++    fn collects_blade_view_ids_from_docs_snapshot() {
++        let mut docs = HashMap::new();
++        docs.insert(
++            Url::parse("file:///tmp/resources/views/welcome.blade.php").expect("welcome uri"),
++            "<h1>Welcome</h1>".to_string(),
++        );
++        docs.insert(
++            Url::parse("file:///tmp/resources/views/admin/users/index.blade.php").expect("admin uri"),
++            "<h1>Users</h1>".to_string(),
++        );
++        docs.insert(
++            Url::parse("file:///tmp/app/Services/Helper.php").expect("php uri"),
++            "<?php".to_string(),
++        );
++
++        let ids = collect_blade_view_ids(&docs);
++        assert!(ids.contains(&"welcome".to_string()));
++        assert!(ids.contains(&"admin.users.index".to_string()));
++        assert_eq!(ids.len(), 2);
+     }
+ 
+     #[test]
+-    fn detects_namespaced_static_member_completion_context() {
+-        let source = "<?php\nApp\\Models\\User::get";
+-        let context = static_member_completion_context(source, Position::new(1, 20));
+-        assert_eq!(context.as_deref(), Some("App\\Models\\User"));
++    fn detects_blade_tag_and_attribute_contexts() {
++        let x_tag = "<x-alerts.error";
++        assert_eq!(
++            blade_tag_name_completion_context(x_tag, Position::new(0, 15)),
++            Some(BladeTagContext::X)
++        );
++        let lw_tag = "<livewire:posts-ta";
++        assert_eq!(
++            blade_tag_name_completion_context(lw_tag, Position::new(0, 18)),
++            Some(BladeTagContext::Livewire)
++        );
++
++        let x_attr = "<x-alerts.error cla";
++        assert_eq!(
++            blade_component_attribute_completion_context(x_attr, Position::new(0, 18)),
++            Some(BladeTagContext::X)
++        );
++        let lw_attr = "<livewire:posts-table wire:m";
++        assert_eq!(
++            blade_component_attribute_completion_context(lw_attr, Position::new(0, 29)),
++            Some(BladeTagContext::Livewire)
++        );
+     }
+ 
+     #[test]
+-    fn detects_instance_member_completion_context() {
+-        let source = "<?php\n$user->get";
+-        let context = instance_member_completion_context(source, Position::new(1, 10));
+-        assert_eq!(context.as_deref(), Some("$user"));
+-    }
++    fn detects_blade_livewire_value_contexts() {
++        let click = "<livewire:posts-table wire:click=\"ref\" />";
++        let click_ctx = blade_livewire_value_completion_context(click, Position::new(0, 37))
++            .expect("wire:click context");
++        assert_eq!(click_ctx.tag, "posts-table");
++        assert!(matches!(click_ctx.kind, super::LivewireValueKind::Action));
+ 
+-    #[test]
+-    fn infers_variable_class_before_position_from_new_assignment() {
+-        let source = "<?php\n$user = new App\\Models\\User();\n$user->get";
+-        let inferred = infer_variable_class_before_position(source, Position::new(2, 10), "$user");
+-        assert_eq!(inferred.as_deref(), Some("App\\Models\\User"));
++        let model = "<livewire:posts-table wire:model='sea' />";
++        let model_ctx = blade_livewire_value_completion_context(model, Position::new(0, 36))
++            .expect("wire:model context");
++        assert_eq!(model_ctx.tag, "posts-table");
++        assert!(matches!(model_ctx.kind, super::LivewireValueKind::Property));
+     }
+ 
+     #[test]
+-    fn skips_variable_class_inference_for_comparison_operator() {
+-        let source = "<?php\nif ($user == new App\\Models\\User()) {}\n$user->get";
+-        let inferred = infer_variable_class_before_position(source, Position::new(2, 10), "$user");
+-        assert!(inferred.is_none());
+-    }
++    fn infers_livewire_component_class_candidates_from_tag() {
++        let candidates = infer_livewire_component_class_candidates("posts-table");
++        assert!(candidates.contains(&"PostsTable".to_string()));
++        assert!(candidates.contains(&"App\\Livewire\\PostsTable".to_string()));
++        assert!(candidates.contains(&"App\\Http\\Livewire\\PostsTable".to_string()));
+ 
+-    #[test]
+-    fn skips_variable_class_inference_inside_string_or_comment() {
+-        let source = "<?php\n// $user = new App\\Models\\Ghost();\n$txt = \"$user = new App\\Models\\Ghost()\";\n$user = new App\\Models\\User();\n$user->get";
+-        let inferred = infer_variable_class_before_position(source, Position::new(4, 10), "$user");
+-        assert_eq!(inferred.as_deref(), Some("App\\Models\\User"));
++        let nested = infer_livewire_component_class_candidates("admin.posts-table");
++        assert!(nested.contains(&"PostsTable".to_string()));
++        assert!(nested.contains(&"App\\Livewire\\Admin\\PostsTable".to_string()));
++        assert!(nested.contains(&"App\\Http\\Livewire\\Admin\\PostsTable".to_string()));
+     }
+ 
+     #[test]
+-    fn skips_variable_class_inference_for_assignments_after_cursor_on_same_line() {
+-        let source = "<?php\n$user->get(); $user = new App\\Models\\User();";
+-        let inferred = infer_variable_class_before_position(source, Position::new(1, 10), "$user");
+-        assert!(inferred.is_none());
++    fn extracts_livewire_public_actions_and_properties() {
++        let source = "<?php\nclass PostsTable extends Component {\n    public string $search = '';\n    protected string $hidden = '';\n    public static string $global = '';\n    public function render() {}\n    public function mount() {}\n    public function updatingSearch() {}\n    public function updatedSearch() {}\n    public function refresh() {}\n    public function archivePost(int $id) {}\n    protected function hiddenAction() {}\n    private function secretAction() {}\n    public function __invoke() {}\n}\n";
++        let lifecycle = livewire_lifecycle_method_names();
++        let extracted = extract_livewire_public_members_from_class_text(source, &lifecycle);
++        assert!(extracted.actions.contains("refresh"));
++        assert!(extracted.actions.contains("archivePost"));
++        assert!(!extracted.actions.contains("render"));
++        assert!(!extracted.actions.contains("mount"));
++        assert!(!extracted.actions.contains("updatingSearch"));
++        assert!(!extracted.actions.contains("updatedSearch"));
++        assert!(!extracted.actions.contains("__invoke"));
++        assert!(!extracted.actions.contains("hiddenAction"));
++        assert!(extracted.properties.contains("search"));
++        assert!(!extracted.properties.contains("hidden"));
++        assert!(!extracted.properties.contains("global"));
+     }
+ 
+     #[test]
+-    fn infers_variable_class_before_position_with_uppercase_new_keyword() {
+-        let source = "<?php\n$user = NEW App\\Models\\User();\n$user->get";
+-        let inferred = infer_variable_class_before_position(source, Position::new(2, 10), "$user");
+-        assert_eq!(inferred.as_deref(), Some("App\\Models\\User"));
++    fn extracts_blade_component_names_tags_and_attributes() {
++        let uri = Url::parse("file:///tmp/resources/views/components/alerts/error.blade.php")
++            .expect("component uri");
++        let names = extract_blade_component_names_from_uri(&uri);
++        assert!(names.contains("alerts.error"));
++
++        let text = "<x-alerts.error class=\"x\" :theme=\"$theme\" />\n<livewire:posts-table wire:model=\"search\" wire:click=\"refresh\" />";
++        let x_tags = extract_blade_tag_names_from_text(text, BladeTagContext::X);
++        let lw_tags = extract_blade_tag_names_from_text(text, BladeTagContext::Livewire);
++        assert!(x_tags.contains("alerts.error"));
++        assert!(lw_tags.contains("posts-table"));
++
++        let x_attrs = extract_blade_attributes_from_text(text, BladeTagContext::X);
++        let lw_attrs = extract_blade_attributes_from_text(text, BladeTagContext::Livewire);
++        assert!(x_attrs.contains("class"));
++        assert!(x_attrs.contains(":theme"));
++        assert!(lw_attrs.contains("wire:model"));
++        assert!(lw_attrs.contains("wire:click"));
+     }
+ 
+     #[test]
+-    fn infers_variable_class_before_position_from_generic_var_annotation() {
+-        let source = "<?php\n/** @var Collection<int, App\\Models\\User> $users */\n$users->first();";
+-        let inferred = infer_variable_class_before_position(source, Position::new(2, 11), "$users");
+-        assert_eq!(inferred.as_deref(), Some("Collection"));
++    fn collects_blade_attributes_and_variables_from_snapshot() {
++        let mut docs = HashMap::new();
++        docs.insert(
++            Url::parse("file:///tmp/page.blade.php").expect("blade uri"),
++            "<x-alert class=\"mb-2\" :title=\"$title\" id=\"alert-1\" />\n<livewire:posts-table wire:model=\"search\" wire:click=\"refresh\" />\n{{ $title }} {{ $slot }}".to_string(),
++        );
++
++        let x_attrs = collect_blade_component_attributes(&docs, BladeTagContext::X);
++        let lw_attrs = collect_blade_component_attributes(&docs, BladeTagContext::Livewire);
++        assert!(x_attrs.contains(&"class".to_string()));
++        assert!(x_attrs.contains(&":title".to_string()));
++        assert!(lw_attrs.contains(&"wire:model".to_string()));
++        assert!(lw_attrs.contains(&"wire:click".to_string()));
++
++        let vars = collect_blade_template_variables(&docs);
++        assert!(vars.contains(&"$slot".to_string()));
++        assert!(vars.contains(&"$attributes".to_string()));
++        assert!(vars.contains(&"$title".to_string()));
+     }
+ 
+     #[test]
+-    fn infers_variable_class_before_position_from_nullable_union_var_annotation() {
+-        let source = "<?php\n/** @var ?App\\Models\\User|null $user */\n$user->getId();";
+-        let inferred = infer_variable_class_before_position(source, Position::new(2, 10), "$user");
+-        assert_eq!(inferred.as_deref(), Some("App\\Models\\User"));
++    fn detects_blade_variable_completion_context() {
++        let source = "{{ $tit }}";
++        let ctx = blade_variable_completion_context(source, Position::new(0, 7));
++        assert_eq!(ctx, Some(()));
+     }
+ 
+     #[test]
+-    fn skips_var_annotation_inference_inside_string_literal() {
+-        let source = "<?php\n$txt = \"@var App\\Models\\Ghost $user\";\n$user->getId();";
+-        let inferred = infer_variable_class_before_position(source, Position::new(2, 10), "$user");
+-        assert!(inferred.is_none());
++    fn extracts_blade_variables_from_text() {
++        let vars = extract_blade_variables_from_text("{{ $slot }} {{ $attributes }} {{ $userName }}");
++        assert!(vars.contains("$slot"));
++        assert!(vars.contains("$attributes"));
++        assert!(vars.contains("$userName"));
+     }
+ 
+     #[test]
+-    fn infers_variable_raw_type_annotation_before_position() {
+-        let source = "<?php\n/** @var Repository<App\\Models\\User> $repo */\n$repo->find();";
+-        let inferred = infer_variable_type_annotation_before_position(source, Position::new(2, 10), "$repo");
+-        assert_eq!(inferred.as_deref(), Some("Repository<App\\Models\\User>"));
++    fn extracts_blade_section_names_from_yield_and_section() {
++        let source = "@yield('content')\n@section(\"header\")\n";
++        let names = extract_blade_section_names_from_text(source);
++        assert!(names.contains("content"));
++        assert!(names.contains("header"));
+     }
+ 
+     #[test]
+-    fn parses_generic_type_instance_arguments() {
+-        let parsed = parse_generic_type_instance("Repository<App\\Models\\User, int>").expect("parsed generic");
+-        assert_eq!(parsed.0, "Repository");
+-        assert_eq!(parsed.1, vec!["App\\Models\\User", "int"]);
++    fn detects_blade_template_heuristics() {
++        let blade = "@extends('layouts.app')\n@section('content')\n{{ $slot }}\n@endsection\n";
++        assert!(looks_like_blade_template(blade));
++
++        let php = "<?php\nfunction run() { return 1; }\n";
++        assert!(!looks_like_blade_template(php));
+     }
+ 
+     #[test]
+-    fn parses_nullable_generic_type_instance() {
+-        let parsed = parse_generic_type_instance("?Repository<App\\Models\\User>").expect("parsed generic");
+-        assert_eq!(parsed.0, "Repository");
+-        assert_eq!(parsed.1, vec!["App\\Models\\User"]);
++    fn formats_blade_directive_spacing() {
++        assert_eq!(format_blade_directive_spacing("@if($a)"), "@if ($a)");
++        assert_eq!(format_blade_directive_spacing("@foreach($items as $item)"), "@foreach ($items as $item)");
+     }
+ 
+     #[test]
+-    fn parses_union_generic_type_instance() {
+-        let parsed = parse_generic_type_instance("Repository<App\\Models\\User>|null").expect("parsed generic");
+-        assert_eq!(parsed.0, "Repository");
+-        assert_eq!(parsed.1, vec!["App\\Models\\User"]);
++    fn format_document_applies_blade_directive_spacing() {
++        let source = "@if($ready)\n<div>ok</div>\n@endif\n";
++        let formatted = format_document(source);
++        assert!(formatted.starts_with("@if ($ready)\n"));
+     }
+ 
+     #[test]
+-    fn parses_nested_generic_type_instance_arguments() {
+-        let parsed = parse_generic_type_instance("Repository<Iterator<App\\Models\\User>, int>").expect("parsed generic");
+-        assert_eq!(parsed.0, "Repository");
+-        assert_eq!(parsed.1, vec!["Iterator<App\\Models\\User>", "int"]);
++    fn tokenizes_blade_directive_as_semantic_function_token() {
++        let source = "@if ($ok)\n<div>{{ $ok }}</div>\n@endif\n";
++        let tokens = tokenize_php_document(source);
++        assert!(tokens.iter().any(|t| t.line == 0 && t.char == 0 && t.token_type == 1));
+     }
+ 
+     #[test]
+-    fn parses_namespaced_generic_type_instance() {
+-        let parsed = parse_generic_type_instance("\\App\\Models\\Repository<App\\Models\\User>").expect("parsed generic");
+-        assert_eq!(parsed.0, "App\\Models\\Repository");
+-        assert_eq!(parsed.1, vec!["App\\Models\\User"]);
++    fn tokenizes_html_tags_in_template() {
++        let source = "<section>\n  <div class=\"x\"></div>\n</section>\n";
++        let tokens = tokenize_php_document(source);
++        assert!(tokens.iter().any(|t| t.line == 0 && t.char == 1 && t.token_type == 5));
++        assert!(tokens.iter().any(|t| t.line == 1 && t.char == 3 && t.token_type == 5));
+     }
+ 
+     #[test]
+-    fn rejects_malformed_generic_type_instance() {
+-        assert!(parse_generic_type_instance("Repository<App\\Models\\User>>").is_none());
++    fn tokenizes_embedded_js_and_css_keywords_in_template() {
++        let source = "<script>\nconst value = 1;\nfunction run() { return value; }\n</script>\n<style>\ncolor: red;\nmargin-top: 4px;\n</style>\n";
++        let tokens = tokenize_php_document(source);
++        assert!(tokens.iter().any(|t| t.line == 1 && t.token_type == 1));
++        assert!(tokens.iter().any(|t| t.line == 2 && t.token_type == 1));
++        assert!(tokens.iter().any(|t| t.line == 5 && t.token_type == 0));
++        assert!(tokens.iter().any(|t| t.line == 6 && t.token_type == 0));
+     }
+ 
+     #[test]
+-    fn applies_template_substitution_to_member_type() {
+-        let mapping = BTreeMap::from([
+-            ("TModel".to_string(), "App\\Models\\User".to_string()),
+-            ("TKey".to_string(), "int".to_string()),
+-        ]);
+-
+-        let resolved = apply_template_substitution("Collection<TKey, TModel>|null", &mapping);
+-        assert_eq!(resolved, "Collection<int, App\\Models\\User>|null");
++    fn scores_local_function_higher_than_keyword() {
++        let function_score = completion_score(
++            "run_test",
++            "run",
++            true,
++            Some(CompletionItemKind::FUNCTION),
++            CompletionContextKind::General,
++        );
++        let keyword_score = completion_score(
++            "return",
++            "re",
++            false,
++            Some(CompletionItemKind::KEYWORD),
++            CompletionContextKind::General,
++        );
++        assert!(function_score > keyword_score);
+     }
+ 
+     #[test]
+-    fn skips_static_member_completion_context_inside_string() {
+-        let source = "<?php\n\"User::get\"";
+-        let context = static_member_completion_context(source, Position::new(1, 10));
+-        assert!(context.is_none());
++    fn includes_magic_constants_in_completion_keywords() {
++        let constants = php_magic_constants();
++        assert!(constants.contains(&"__FILE__"));
++        assert!(constants.contains(&"__DIR__"));
++        assert!(constants.contains(&"__NAMESPACE__"));
+     }
+ 
+     #[test]
+-    fn skips_static_member_completion_context_inside_comment() {
+-        let source = "<?php\n// User::get";
+-        let context = static_member_completion_context(source, Position::new(1, 12));
+-        assert!(context.is_none());
++    fn detects_use_statement_completion_context() {
++        let source = "<?php\nuse App\\";
++        let context = completion_context_kind(source, Position::new(1, 8));
++        assert!(matches!(context, CompletionContextKind::UseStatement));
+     }
+ 
+     #[test]
+-    fn collects_class_member_labels_for_completion() {
+-        let text = "<?php\nclass User {\n  public function getName() {}\n  private $email;\n}\n";
+-        let class_symbol = PhpSymbol {
+-            name: "User".to_string(),
+-            namespace: None,
+-            kind: SymbolKind::CLASS,
+-            parameters: Vec::new(),
+-            return_type: None,
+-            range: Range::new(Position::new(1, 6), Position::new(1, 10)),
+-        };
++    fn parses_namespace_declaration() {
++        let ns = parse_namespace_declaration("namespace App\\Domain\\Auth;");
++        assert!(matches!(
++            ns,
++            Some(NamespaceDeclaration::Inline(value)) if value == "App\\Domain\\Auth"
++        ));
+ 
+-        let members = collect_class_member_labels(text, &class_symbol);
+-        assert!(members.iter().any(|(name, kind)| name == "getName" && *kind == CompletionItemKind::METHOD));
+-        assert!(members.iter().any(|(name, kind)| name == "email" && *kind == CompletionItemKind::FIELD));
++        let block = parse_namespace_declaration("namespace App\\Domain { ");
++        assert!(matches!(
++            block,
++            Some(NamespaceDeclaration::Block(value)) if value == "App\\Domain"
++        ));
++
++        let global = parse_namespace_declaration("namespace;");
++        assert!(matches!(global, Some(NamespaceDeclaration::Global)));
+     }
+ 
+     #[test]
+-    fn collects_class_member_labels_with_braces_in_strings_and_comments() {
+-        let text = "<?php\nclass User {\n  public function getName() {\n    $x = \"{not-a-brace}\";\n    // } commented brace\n    return $x;\n  }\n  private $email;\n}\n";
+-        let class_symbol = PhpSymbol {
+-            name: "User".to_string(),
+-            namespace: None,
+-            kind: SymbolKind::CLASS,
+-            parameters: Vec::new(),
+-            return_type: None,
+-            range: Range::new(Position::new(1, 6), Position::new(1, 10)),
+-        };
++    fn uses_fqn_label_in_use_context() {
++        let source = "<?php\nnamespace App\\Models;\nclass User {}";
++        let symbols = extract_symbols(source);
++        let user = symbols.iter().find(|s| s.name == "User").expect("user symbol");
+ 
+-        let members = collect_class_member_labels(text, &class_symbol);
+-        assert!(members.iter().any(|(name, kind)| name == "getName" && *kind == CompletionItemKind::METHOD));
+-        assert!(members.iter().any(|(name, kind)| name == "email" && *kind == CompletionItemKind::FIELD));
++        let label = symbol_completion_label(user, CompletionContextKind::UseStatement);
++        assert_eq!(label, "App\\Models\\User");
+     }
+ 
+     #[test]
+-    fn collects_class_member_labels_after_long_class_declaration() {
+-        let text = "<?php\nclass User\n  extends BaseUser\n  implements A,\n             B,\n             C\n{\n  public function getId() {}\n}\n";
+-        let class_symbol = PhpSymbol {
+-            name: "User".to_string(),
+-            namespace: None,
+-            kind: SymbolKind::CLASS,
+-            parameters: Vec::new(),
+-            return_type: None,
+-            range: Range::new(Position::new(1, 6), Position::new(1, 10)),
+-        };
++    fn parses_use_aliases_and_resolves_alias_query() {
++        let source = "<?php\nnamespace App\\Http\\Controllers;\nuse App\\Models\\User as AppUser;\n";
++        let aliases = parse_use_aliases(source);
++        assert_eq!(aliases.get("AppUser"), Some(&"App\\Models\\User".to_string()));
+ 
+-        let members = collect_class_member_labels(text, &class_symbol);
+-        assert!(members.iter().any(|(name, kind)| name == "getId" && *kind == CompletionItemKind::METHOD));
++        let queries = resolve_symbol_queries(source, Position::new(2, 1), "AppUser");
++        assert_eq!(queries.first(), Some(&"App\\Models\\User".to_string()));
++        assert!(queries.contains(&"App\\Models\\User".to_string()));
+     }
+ 
+     #[test]
+-    fn collects_multiple_class_properties_on_single_line() {
+-        let text = "<?php\nclass Config {\n  public $host, $port, $user;\n}\n";
+-        let class_symbol = PhpSymbol {
+-            name: "Config".to_string(),
+-            namespace: None,
+-            kind: SymbolKind::CLASS,
+-            parameters: Vec::new(),
+-            return_type: None,
+-            range: Range::new(Position::new(1, 6), Position::new(1, 12)),
+-        };
++    fn ignores_closure_use_syntax_when_parsing_aliases() {
++        let source = "<?php\n$fn = function() use($user) { return $user; };\nuse App\\Models\\User;";
++        let aliases = parse_use_aliases(source);
++        assert_eq!(aliases.get("User"), Some(&"App\\Models\\User".to_string()));
++        assert_eq!(aliases.len(), 1);
++    }
+ 
+-        let members = collect_class_member_labels(text, &class_symbol);
+-        assert!(members.iter().any(|(name, kind)| name == "host" && *kind == CompletionItemKind::FIELD));
+-        assert!(members.iter().any(|(name, kind)| name == "port" && *kind == CompletionItemKind::FIELD));
+-        assert!(members.iter().any(|(name, kind)| name == "user" && *kind == CompletionItemKind::FIELD));
++    #[test]
++    fn parses_group_use_aliases() {
++        let source = "<?php\nuse App\\Models\\{User, Post as BlogPost};\n";
++        let aliases = parse_use_aliases(source);
++        assert_eq!(aliases.get("User"), Some(&"App\\Models\\User".to_string()));
++        assert_eq!(aliases.get("BlogPost"), Some(&"App\\Models\\Post".to_string()));
+     }
+ 
+     #[test]
+-    fn extracts_promoted_property_names_from_constructor_signature() {
+-        let names = extract_promoted_property_names(
+-            "function __construct(public string $email, private int $id, $plain) {}",
+-        );
+-        assert_eq!(names, vec!["email".to_string(), "id".to_string()]);
++    fn splits_use_entries_at_top_level_commas() {
++        let entries = split_use_entries("App\\A, App\\B\\{C, D as E}, App\\F");
++        assert_eq!(entries.len(), 3);
++        assert_eq!(entries[1], "App\\B\\{C, D as E}");
+     }
+ 
+     #[test]
+-    fn extracts_promoted_property_names_with_protected_visibility() {
+-        let names = extract_promoted_property_names(
+-            "function __construct(protected string $token, $plain) {}",
++    fn parses_single_use_entry_alias() {
++        let mut aliases = HashMap::new();
++        parse_single_use_entry("App\\Support\\Str as StringHelper", &mut aliases);
++        assert_eq!(
++            aliases.get("StringHelper"),
++            Some(&"App\\Support\\Str".to_string())
+         );
+-        assert_eq!(names, vec!["token".to_string()]);
+     }
+ 
+     #[test]
+-    fn collects_promoted_properties_from_constructor_for_completion() {
+-        let text = "<?php\nclass User {\n  public function __construct(public string $email, private int $id) {}\n}\n";
+-        let class_symbol = PhpSymbol {
++    fn builds_search_terms_for_target_from_document_context() {
++        let source = "<?php\nnamespace App\\Http;\nuse App\\Models\\User as AppUser;\n";
++        let terms = search_terms_for_target_in_document("App\\Models\\User", source, true);
++        assert!(terms.contains(&"AppUser".to_string()));
++        assert!(terms.contains(&"App\\Models\\User".to_string()));
++        assert!(terms.contains(&"\\App\\Models\\User".to_string()));
++    }
++
++    #[test]
++    fn builds_search_terms_for_group_use_aliases() {
++        let source = "<?php\nuse App\\Models\\{User as AppUser, Post};\n";
++
++        let terms_for_refs = search_terms_for_target_in_document("App\\Models\\User", source, true);
++        assert!(terms_for_refs.contains(&"AppUser".to_string()));
++
++        let terms_for_rename = search_terms_for_target_in_document("App\\Models\\User", source, false);
++        assert!(!terms_for_rename.contains(&"AppUser".to_string()));
++        assert!(terms_for_rename.contains(&"App\\Models\\User".to_string()));
++    }
++
++    #[test]
++    fn splits_fqn_into_namespace_and_short_name() {
++        let (ns, short) = split_fqn("App\\Models\\User");
++        assert_eq!(ns.as_deref(), Some("App\\Models"));
++        assert_eq!(short, "User");
++    }
++
++    #[test]
++    fn detects_type_like_names() {
++        assert!(looks_like_type_name("User"));
++        assert!(looks_like_type_name("_InternalType"));
++        assert!(!looks_like_type_name("user"));
++        assert!(!looks_like_type_name("$User"));
++    }
++
++    #[test]
++    fn computes_use_insertion_position() {
++        let source = "<?php\nnamespace App\\Http;\nuse App\\Models\\Post;\nclass C {}";
++        let pos = find_use_insertion_position(source);
++        assert_eq!(pos.line, 3);
++        assert_eq!(pos.character, 0);
++    }
++
++    #[test]
++    fn matches_symbol_with_fqn_query() {
++        let symbol = PhpSymbol {
+             name: "User".to_string(),
+-            namespace: None,
++            namespace: Some("App\\Models".to_string()),
+             kind: SymbolKind::CLASS,
+             parameters: Vec::new(),
+             return_type: None,
+-            range: Range::new(Position::new(1, 6), Position::new(1, 10)),
++            range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+         };
+ 
+-        let members = collect_class_member_labels(text, &class_symbol);
+-        assert!(members.iter().any(|(name, kind)| name == "email" && *kind == CompletionItemKind::FIELD));
+-        assert!(members.iter().any(|(name, kind)| name == "id" && *kind == CompletionItemKind::FIELD));
++        assert!(symbol_matches_query(&symbol, "App\\Models\\User"));
++        assert!(symbol_matches_query(&symbol, "User"));
++        assert!(!symbol_matches_query(&symbol, "App\\Models\\Order"));
+     }
+ 
+     #[test]
+-    fn extracts_promoted_property_names_from_multiline_constructor_signature() {
+-        let lines = vec![
+-            "public function __construct(",
+-            "  public string $email,",
+-            "  private int $id",
+-            ") {}",
+-        ];
+-        let names = extract_promoted_property_names_from_lines(&lines, 0);
+-        assert_eq!(names, vec!["email".to_string(), "id".to_string()]);
++    fn recognizes_type_symbol_kinds() {
++        assert!(is_type_symbol_kind(SymbolKind::CLASS));
++        assert!(is_type_symbol_kind(SymbolKind::INTERFACE));
++        assert!(is_type_symbol_kind(SymbolKind::ENUM));
++        assert!(!is_type_symbol_kind(SymbolKind::FUNCTION));
+     }
+ 
+     #[test]
+-    fn extracts_promoted_property_type_hints_from_constructor_signature() {
+-        let lines = vec!["function __construct(public string $email, private ?User $owner, protected Collection<int, User> $users) {}"];
+-        let entries = extract_promoted_property_entries_from_lines(&lines, 0);
++    fn finds_type_definition_from_current_document() {
++        let current_uri = Url::parse("file:///tmp/current.php").expect("current uri");
++        let index = HashMap::from([(
++            current_uri.clone(),
++            vec![PhpSymbol {
++                name: "User".to_string(),
++                namespace: Some("App\\Models".to_string()),
++                kind: SymbolKind::CLASS,
++                parameters: Vec::new(),
++                return_type: None,
++                range: Range::new(Position::new(2, 0), Position::new(2, 4)),
++            }],
++        )]);
+ 
+-        assert!(entries
+-            .iter()
+-            .any(|e| e.name == "email" && e.type_hint.as_deref() == Some("string")));
+-        assert!(entries
+-            .iter()
+-            .any(|e| e.name == "owner" && e.type_hint.as_deref() == Some("?User")));
+-        assert!(entries
+-            .iter()
+-            .any(|e| e.name == "users" && e.type_hint.as_deref() == Some("Collection<int, User>")));
++        let location = find_type_definition_in_index(
++            &index,
++            &current_uri,
++            &["App\\Models\\User".to_string()],
++        )
++        .expect("location");
++        assert_eq!(location.uri, current_uri);
++        assert_eq!(location.range.start, Position::new(2, 0));
+     }
+ 
+     #[test]
+-    fn collects_promoted_properties_from_multiline_constructor_for_completion() {
+-        let text = "<?php\nclass User {\n  public function __construct(\n    public string $email,\n    private int $id\n  ) {}\n}\n";
+-        let class_symbol = PhpSymbol {
++    fn skips_non_type_symbols_when_finding_type_definition() {
++        let current_uri = Url::parse("file:///tmp/current.php").expect("current uri");
++        let external_uri = Url::parse("file:///tmp/external.php").expect("external uri");
++        let index = HashMap::from([
++            (
++                current_uri.clone(),
++                vec![PhpSymbol {
++                    name: "User".to_string(),
++                    namespace: Some("App\\Models".to_string()),
++                    kind: SymbolKind::FUNCTION,
++                    parameters: Vec::new(),
++                    return_type: None,
++                    range: Range::new(Position::new(1, 0), Position::new(1, 4)),
++                }],
++            ),
++            (
++                external_uri.clone(),
++                vec![PhpSymbol {
++                    name: "User".to_string(),
++                    namespace: Some("App\\Models".to_string()),
++                    kind: SymbolKind::CLASS,
++                    parameters: Vec::new(),
++                    return_type: None,
++                    range: Range::new(Position::new(6, 0), Position::new(6, 4)),
++                }],
++            ),
++        ]);
++
++        let location =
++            find_type_definition_in_index(&index, &current_uri, &["User".to_string()]).expect("location");
++        assert_eq!(location.uri, external_uri);
++        assert_eq!(location.range.start, Position::new(6, 0));
++    }
++
++    #[test]
++    fn prefers_current_document_type_definition() {
++        let current_uri = Url::parse("file:///tmp/current.php").expect("current uri");
++        let external_uri = Url::parse("file:///tmp/external.php").expect("external uri");
++        let index = HashMap::from([
++            (
++                current_uri.clone(),
++                vec![PhpSymbol {
++                    name: "User".to_string(),
++                    namespace: Some("App\\Models".to_string()),
++                    kind: SymbolKind::CLASS,
++                    parameters: Vec::new(),
++                    return_type: None,
++                    range: Range::new(Position::new(3, 0), Position::new(3, 4)),
++                }],
++            ),
++            (
++                external_uri,
++                vec![PhpSymbol {
++                    name: "User".to_string(),
++                    namespace: Some("App\\Models".to_string()),
++                    kind: SymbolKind::CLASS,
++                    parameters: Vec::new(),
++                    return_type: None,
++                    range: Range::new(Position::new(8, 0), Position::new(8, 4)),
++                }],
++            ),
++        ]);
++
++        let location =
++            find_type_definition_in_index(&index, &current_uri, &["User".to_string()]).expect("location");
++        assert_eq!(location.uri, current_uri);
++        assert_eq!(location.range.start, Position::new(3, 0));
++    }
++
++    #[test]
++    fn returns_none_when_type_definition_not_found() {
++        let current_uri = Url::parse("file:///tmp/current.php").expect("current uri");
++        let index = HashMap::from([(
++            current_uri.clone(),
++            vec![PhpSymbol {
++                name: "run".to_string(),
++                namespace: None,
++                kind: SymbolKind::FUNCTION,
++                parameters: Vec::new(),
++                return_type: None,
++                range: Range::new(Position::new(1, 0), Position::new(1, 3)),
++            }],
++        )]);
++
++        let location = find_type_definition_in_index(&index, &current_uri, &["User".to_string()]);
++        assert!(location.is_none());
++    }
++
++    #[test]
++    fn matches_workspace_symbol_query_by_fqn_and_kind_tokens() {
++        let symbol = PhpSymbol {
+             name: "User".to_string(),
+-            namespace: None,
++            namespace: Some("App\\Models".to_string()),
+             kind: SymbolKind::CLASS,
+             parameters: Vec::new(),
+             return_type: None,
+-            range: Range::new(Position::new(1, 6), Position::new(1, 10)),
++            range: Range::new(Position::new(0, 0), Position::new(0, 4)),
+         };
+ 
+-        let members = collect_class_member_labels(text, &class_symbol);
+-        assert!(members.iter().any(|(name, kind)| name == "email" && *kind == CompletionItemKind::FIELD));
+-        assert!(members.iter().any(|(name, kind)| name == "id" && *kind == CompletionItemKind::FIELD));
++        assert!(workspace_symbol_matches_query(&symbol, "app\\models class"));
++        assert!(workspace_symbol_matches_query(&symbol, "user"));
++        assert!(!workspace_symbol_matches_query(&symbol, "service interface"));
+     }
+ 
+     #[test]
+-    fn marks_static_members_in_class_member_entries() {
+-        let text = "<?php\nclass User {\n  public static function find(): ?User {}\n  public function load(): Collection<int, User> {}\n  private static array $cache;\n  private ?string $email;\n}\n";
+-        let class_symbol = PhpSymbol {
+-            name: "User".to_string(),
++    fn matches_workspace_symbol_query_with_empty_input() {
++        let symbol = PhpSymbol {
++            name: "run".to_string(),
+             namespace: None,
+-            kind: SymbolKind::CLASS,
++            kind: SymbolKind::FUNCTION,
+             parameters: Vec::new(),
+             return_type: None,
+-            range: Range::new(Position::new(1, 6), Position::new(1, 10)),
++            range: Range::new(Position::new(0, 0), Position::new(0, 3)),
+         };
+ 
+-        let entries = collect_class_member_entries(text, &class_symbol);
+-        assert!(entries.iter().any(|e| e.label == "find" && e.is_static));
+-        assert!(entries.iter().any(|e| e.label == "load" && !e.is_static));
+-        assert!(entries.iter().any(|e| e.label == "cache" && e.is_static));
+-        assert!(entries.iter().any(|e| e.label == "email" && !e.is_static));
+-        assert!(entries
+-            .iter()
+-            .any(|e| e.label == "find" && e.type_hint.as_deref() == Some("?User")));
+-        assert!(entries
+-            .iter()
+-            .any(|e| e.label == "load" && e.type_hint.as_deref() == Some("Collection<int, User>")));
+-        assert!(entries
+-            .iter()
+-            .any(|e| e.label == "cache" && e.type_hint.as_deref() == Some("array")));
+-        assert!(entries
+-            .iter()
+-            .any(|e| e.label == "email" && e.type_hint.as_deref() == Some("?string")));
++        assert!(workspace_symbol_matches_query(&symbol, ""));
++        assert!(workspace_symbol_matches_query(&symbol, "   "));
+     }
+ 
+     #[test]
+-    fn marks_promoted_properties_as_non_static_entries() {
+-        let text =
+-            "<?php\nclass User {\n  public function __construct(public string $email, private int $id) {}\n}\n";
+-        let class_symbol = PhpSymbol {
++    fn scores_workspace_symbol_higher_for_exact_name_match() {
++        let exact = PhpSymbol {
+             name: "User".to_string(),
+-            namespace: None,
++            namespace: Some("App\\Models".to_string()),
+             kind: SymbolKind::CLASS,
+             parameters: Vec::new(),
+             return_type: None,
+-            range: Range::new(Position::new(1, 6), Position::new(1, 10)),
++            range: Range::new(Position::new(0, 0), Position::new(0, 4)),
+         };
+-
+-        let entries = collect_class_member_entries(text, &class_symbol);
+-        assert!(entries
+-            .iter()
+-            .any(|e| e.label == "email" && !e.is_static && e.type_hint.as_deref() == Some("string")));
+-        assert!(entries
++        let prefix = PhpSymbol {
++            name: "UserRepository".to_string(),
++            namespace: Some("App\\Models".to_string()),
++            kind: SymbolKind::CLASS,
++            parameters: Vec::new(),
++            return_type: None,
++            range: Range::new(Position::new(0, 0), Position::new(0, 13)),
++        };
++
++        let exact_score = workspace_symbol_score(&exact, "user").expect("exact score");
++        let prefix_score = workspace_symbol_score(&prefix, "user").expect("prefix score");
++        assert!(exact_score > prefix_score);
++    }
++
++    #[test]
++    fn skips_workspace_symbol_score_when_query_not_matched() {
++        let symbol = PhpSymbol {
++            name: "User".to_string(),
++            namespace: Some("App\\Models".to_string()),
++            kind: SymbolKind::CLASS,
++            parameters: Vec::new(),
++            return_type: None,
++            range: Range::new(Position::new(0, 0), Position::new(0, 4)),
++        };
++
++        assert!(workspace_symbol_score(&symbol, "invoice").is_none());
++    }
++
++    #[test]
++    fn detects_call_ranges_for_function_calls_only() {
++        let source = "<?php\nrun_test($a);\n$run_test = 1;\nrun_test\n";
++        let ranges = call_ranges_for_name(source, "run_test");
++        assert_eq!(ranges.len(), 1);
++        assert_eq!(ranges[0].start, Position::new(1, 0));
++    }
++
++    #[test]
++    fn detects_static_member_completion_context() {
++        let source = "<?php\nUser::get";
++        let context = static_member_completion_context(source, Position::new(1, 9));
++        assert_eq!(context.as_deref(), Some("User"));
++    }
++
++    #[test]
++    fn detects_namespaced_static_member_completion_context() {
++        let source = "<?php\nApp\\Models\\User::get";
++        let context = static_member_completion_context(source, Position::new(1, 20));
++        assert_eq!(context.as_deref(), Some("App\\Models\\User"));
++    }
++
++    #[test]
++    fn detects_instance_member_completion_context() {
++        let source = "<?php\n$user->get";
++        let context = instance_member_completion_context(source, Position::new(1, 10));
++        assert_eq!(context.as_deref(), Some("$user"));
++    }
++
++    #[test]
++    fn infers_variable_class_before_position_from_new_assignment() {
++        let source = "<?php\n$user = new App\\Models\\User();\n$user->get";
++        let inferred = infer_variable_class_before_position(source, Position::new(2, 10), "$user");
++        assert_eq!(inferred.as_deref(), Some("App\\Models\\User"));
++    }
++
++    #[test]
++    fn skips_variable_class_inference_for_comparison_operator() {
++        let source = "<?php\nif ($user == new App\\Models\\User()) {}\n$user->get";
++        let inferred = infer_variable_class_before_position(source, Position::new(2, 10), "$user");
++        assert!(inferred.is_none());
++    }
++
++    #[test]
++    fn skips_variable_class_inference_inside_string_or_comment() {
++        let source = "<?php\n// $user = new App\\Models\\Ghost();\n$txt = \"$user = new App\\Models\\Ghost()\";\n$user = new App\\Models\\User();\n$user->get";
++        let inferred = infer_variable_class_before_position(source, Position::new(4, 10), "$user");
++        assert_eq!(inferred.as_deref(), Some("App\\Models\\User"));
++    }
++
++    #[test]
++    fn skips_variable_class_inference_for_assignments_after_cursor_on_same_line() {
++        let source = "<?php\n$user->get(); $user = new App\\Models\\User();";
++        let inferred = infer_variable_class_before_position(source, Position::new(1, 10), "$user");
++        assert!(inferred.is_none());
++    }
++
++    #[test]
++    fn infers_variable_class_before_position_with_uppercase_new_keyword() {
++        let source = "<?php\n$user = NEW App\\Models\\User();\n$user->get";
++        let inferred = infer_variable_class_before_position(source, Position::new(2, 10), "$user");
++        assert_eq!(inferred.as_deref(), Some("App\\Models\\User"));
++    }
++
++    #[test]
++    fn infers_variable_class_before_position_from_generic_var_annotation() {
++        let source = "<?php\n/** @var Collection<int, App\\Models\\User> $users */\n$users->first();";
++        let inferred = infer_variable_class_before_position(source, Position::new(2, 11), "$users");
++        assert_eq!(inferred.as_deref(), Some("Collection"));
++    }
++
++    #[test]
++    fn infers_variable_class_before_position_from_nullable_union_var_annotation() {
++        let source = "<?php\n/** @var ?App\\Models\\User|null $user */\n$user->getId();";
++        let inferred = infer_variable_class_before_position(source, Position::new(2, 10), "$user");
++        assert_eq!(inferred.as_deref(), Some("App\\Models\\User"));
++    }
++
++    #[test]
++    fn skips_var_annotation_inference_inside_string_literal() {
++        let source = "<?php\n$txt = \"@var App\\Models\\Ghost $user\";\n$user->getId();";
++        let inferred = infer_variable_class_before_position(source, Position::new(2, 10), "$user");
++        assert!(inferred.is_none());
++    }
++
++    #[test]
++    fn infers_variable_raw_type_annotation_before_position() {
++        let source = "<?php\n/** @var Repository<App\\Models\\User> $repo */\n$repo->find();";
++        let inferred = infer_variable_type_annotation_before_position(source, Position::new(2, 10), "$repo");
++        assert_eq!(inferred.as_deref(), Some("Repository<App\\Models\\User>"));
++    }
++
++    #[test]
++    fn parses_generic_type_instance_arguments() {
++        let parsed = parse_generic_type_instance("Repository<App\\Models\\User, int>").expect("parsed generic");
++        assert_eq!(parsed.0, "Repository");
++        assert_eq!(parsed.1, vec!["App\\Models\\User", "int"]);
++    }
++
++    #[test]
++    fn parses_nullable_generic_type_instance() {
++        let parsed = parse_generic_type_instance("?Repository<App\\Models\\User>").expect("parsed generic");
++        assert_eq!(parsed.0, "Repository");
++        assert_eq!(parsed.1, vec!["App\\Models\\User"]);
++    }
++
++    #[test]
++    fn parses_union_generic_type_instance() {
++        let parsed = parse_generic_type_instance("Repository<App\\Models\\User>|null").expect("parsed generic");
++        assert_eq!(parsed.0, "Repository");
++        assert_eq!(parsed.1, vec!["App\\Models\\User"]);
++    }
++
++    #[test]
++    fn parses_nested_generic_type_instance_arguments() {
++        let parsed = parse_generic_type_instance("Repository<Iterator<App\\Models\\User>, int>").expect("parsed generic");
++        assert_eq!(parsed.0, "Repository");
++        assert_eq!(parsed.1, vec!["Iterator<App\\Models\\User>", "int"]);
++    }
++
++    #[test]
++    fn parses_namespaced_generic_type_instance() {
++        let parsed = parse_generic_type_instance("\\App\\Models\\Repository<App\\Models\\User>").expect("parsed generic");
++        assert_eq!(parsed.0, "App\\Models\\Repository");
++        assert_eq!(parsed.1, vec!["App\\Models\\User"]);
++    }
++
++    #[test]
++    fn rejects_malformed_generic_type_instance() {
++        assert!(parse_generic_type_instance("Repository<App\\Models\\User>>").is_none());
++    }
++
++    #[test]
++    fn applies_template_substitution_to_member_type() {
++        let mapping = BTreeMap::from([
++            ("TModel".to_string(), "App\\Models\\User".to_string()),
++            ("TKey".to_string(), "int".to_string()),
++        ]);
++
++        let resolved = apply_template_substitution("Collection<TKey, TModel>|null", &mapping);
++        assert_eq!(resolved, "Collection<int, App\\Models\\User>|null");
++    }
++
++    #[test]
++    fn skips_static_member_completion_context_inside_string() {
++        let source = "<?php\n\"User::get\"";
++        let context = static_member_completion_context(source, Position::new(1, 10));
++        assert!(context.is_none());
++    }
++
++    #[test]
++    fn skips_static_member_completion_context_inside_comment() {
++        let source = "<?php\n// User::get";
++        let context = static_member_completion_context(source, Position::new(1, 12));
++        assert!(context.is_none());
++    }
++
++    #[test]
++    fn collects_class_member_labels_for_completion() {
++        let text = "<?php\nclass User {\n  public function getName() {}\n  private $email;\n}\n";
++        let class_symbol = PhpSymbol {
++            name: "User".to_string(),
++            namespace: None,
++            kind: SymbolKind::CLASS,
++            parameters: Vec::new(),
++            return_type: None,
++            range: Range::new(Position::new(1, 6), Position::new(1, 10)),
++        };
++
++        let members = collect_class_member_labels(text, &class_symbol);
++        assert!(members.iter().any(|(name, kind)| name == "getName" && *kind == CompletionItemKind::METHOD));
++        assert!(members.iter().any(|(name, kind)| name == "email" && *kind == CompletionItemKind::FIELD));
++    }
++
++    #[test]
++    fn collects_class_member_labels_with_braces_in_strings_and_comments() {
++        let text = "<?php\nclass User {\n  public function getName() {\n    $x = \"{not-a-brace}\";\n    // } commented brace\n    return $x;\n  }\n  private $email;\n}\n";
++        let class_symbol = PhpSymbol {
++            name: "User".to_string(),
++            namespace: None,
++            kind: SymbolKind::CLASS,
++            parameters: Vec::new(),
++            return_type: None,
++            range: Range::new(Position::new(1, 6), Position::new(1, 10)),
++        };
++
++        let members = collect_class_member_labels(text, &class_symbol);
++        assert!(members.iter().any(|(name, kind)| name == "getName" && *kind == CompletionItemKind::METHOD));
++        assert!(members.iter().any(|(name, kind)| name == "email" && *kind == CompletionItemKind::FIELD));
++    }
++
++    #[test]
++    fn collects_class_member_labels_after_long_class_declaration() {
++        let text = "<?php\nclass User\n  extends BaseUser\n  implements A,\n             B,\n             C\n{\n  public function getId() {}\n}\n";
++        let class_symbol = PhpSymbol {
++            name: "User".to_string(),
++            namespace: None,
++            kind: SymbolKind::CLASS,
++            parameters: Vec::new(),
++            return_type: None,
++            range: Range::new(Position::new(1, 6), Position::new(1, 10)),
++        };
++
++        let members = collect_class_member_labels(text, &class_symbol);
++        assert!(members.iter().any(|(name, kind)| name == "getId" && *kind == CompletionItemKind::METHOD));
++    }
++
++    #[test]
++    fn collects_multiple_class_properties_on_single_line() {
++        let text = "<?php\nclass Config {\n  public $host, $port, $user;\n}\n";
++        let class_symbol = PhpSymbol {
++            name: "Config".to_string(),
++            namespace: None,
++            kind: SymbolKind::CLASS,
++            parameters: Vec::new(),
++            return_type: None,
++            range: Range::new(Position::new(1, 6), Position::new(1, 12)),
++        };
++
++        let members = collect_class_member_labels(text, &class_symbol);
++        assert!(members.iter().any(|(name, kind)| name == "host" && *kind == CompletionItemKind::FIELD));
++        assert!(members.iter().any(|(name, kind)| name == "port" && *kind == CompletionItemKind::FIELD));
++        assert!(members.iter().any(|(name, kind)| name == "user" && *kind == CompletionItemKind::FIELD));
++    }
++
++    #[test]
++    fn extracts_promoted_property_names_from_constructor_signature() {
++        let names = extract_promoted_property_names(
++            "function __construct(public string $email, private int $id, $plain) {}",
++        );
++        assert_eq!(names, vec!["email".to_string(), "id".to_string()]);
++    }
++
++    #[test]
++    fn extracts_promoted_property_names_with_protected_visibility() {
++        let names = extract_promoted_property_names(
++            "function __construct(protected string $token, $plain) {}",
++        );
++        assert_eq!(names, vec!["token".to_string()]);
++    }
++
++    #[test]
++    fn collects_promoted_properties_from_constructor_for_completion() {
++        let text = "<?php\nclass User {\n  public function __construct(public string $email, private int $id) {}\n}\n";
++        let class_symbol = PhpSymbol {
++            name: "User".to_string(),
++            namespace: None,
++            kind: SymbolKind::CLASS,
++            parameters: Vec::new(),
++            return_type: None,
++            range: Range::new(Position::new(1, 6), Position::new(1, 10)),
++        };
++
++        let members = collect_class_member_labels(text, &class_symbol);
++        assert!(members.iter().any(|(name, kind)| name == "email" && *kind == CompletionItemKind::FIELD));
++        assert!(members.iter().any(|(name, kind)| name == "id" && *kind == CompletionItemKind::FIELD));
++    }
++
++    #[test]
++    fn extracts_promoted_property_names_from_multiline_constructor_signature() {
++        let lines = vec![
++            "public function __construct(",
++            "  public string $email,",
++            "  private int $id",
++            ") {}",
++        ];
++        let names = extract_promoted_property_names_from_lines(&lines, 0);
++        assert_eq!(names, vec!["email".to_string(), "id".to_string()]);
++    }
++
++    #[test]
++    fn extracts_promoted_property_type_hints_from_constructor_signature() {
++        let lines = vec!["function __construct(public string $email, private ?User $owner, protected Collection<int, User> $users) {}"];
++        let entries = extract_promoted_property_entries_from_lines(&lines, 0);
++
++        assert!(entries
++            .iter()
++            .any(|e| e.name == "email" && e.type_hint.as_deref() == Some("string")));
++        assert!(entries
++            .iter()
++            .any(|e| e.name == "owner" && e.type_hint.as_deref() == Some("?User")));
++        assert!(entries
++            .iter()
++            .any(|e| e.name == "users" && e.type_hint.as_deref() == Some("Collection<int, User>")));
++    }
++
++    #[test]
++    fn collects_promoted_properties_from_multiline_constructor_for_completion() {
++        let text = "<?php\nclass User {\n  public function __construct(\n    public string $email,\n    private int $id\n  ) {}\n}\n";
++        let class_symbol = PhpSymbol {
++            name: "User".to_string(),
++            namespace: None,
++            kind: SymbolKind::CLASS,
++            parameters: Vec::new(),
++            return_type: None,
++            range: Range::new(Position::new(1, 6), Position::new(1, 10)),
++        };
++
++        let members = collect_class_member_labels(text, &class_symbol);
++        assert!(members.iter().any(|(name, kind)| name == "email" && *kind == CompletionItemKind::FIELD));
++        assert!(members.iter().any(|(name, kind)| name == "id" && *kind == CompletionItemKind::FIELD));
++    }
++
++    #[test]
++    fn marks_static_members_in_class_member_entries() {
++        let text = "<?php\nclass User {\n  public static function find(): ?User {}\n  public function load(): Collection<int, User> {}\n  private static array $cache;\n  private ?string $email;\n}\n";
++        let class_symbol = PhpSymbol {
++            name: "User".to_string(),
++            namespace: None,
++            kind: SymbolKind::CLASS,
++            parameters: Vec::new(),
++            return_type: None,
++            range: Range::new(Position::new(1, 6), Position::new(1, 10)),
++        };
++
++        let entries = collect_class_member_entries(text, &class_symbol);
++        assert!(entries.iter().any(|e| e.label == "find" && e.is_static));
++        assert!(entries.iter().any(|e| e.label == "load" && !e.is_static));
++        assert!(entries.iter().any(|e| e.label == "cache" && e.is_static));
++        assert!(entries.iter().any(|e| e.label == "email" && !e.is_static));
++        assert!(entries
++            .iter()
++            .any(|e| e.label == "find" && e.type_hint.as_deref() == Some("?User")));
++        assert!(entries
++            .iter()
++            .any(|e| e.label == "load" && e.type_hint.as_deref() == Some("Collection<int, User>")));
++        assert!(entries
++            .iter()
++            .any(|e| e.label == "cache" && e.type_hint.as_deref() == Some("array")));
++        assert!(entries
++            .iter()
++            .any(|e| e.label == "email" && e.type_hint.as_deref() == Some("?string")));
++    }
++
++    #[test]
++    fn marks_promoted_properties_as_non_static_entries() {
++        let text =
++            "<?php\nclass User {\n  public function __construct(public string $email, private int $id) {}\n}\n";
++        let class_symbol = PhpSymbol {
++            name: "User".to_string(),
++            namespace: None,
++            kind: SymbolKind::CLASS,
++            parameters: Vec::new(),
++            return_type: None,
++            range: Range::new(Position::new(1, 6), Position::new(1, 10)),
++        };
++
++        let entries = collect_class_member_entries(text, &class_symbol);
++        assert!(entries
++            .iter()
++            .any(|e| e.label == "email" && !e.is_static && e.type_hint.as_deref() == Some("string")));
++        assert!(entries
++            .iter()
++            .any(|e| e.label == "id" && !e.is_static && e.type_hint.as_deref() == Some("int")));
++    }
++
++    #[test]
++    fn marks_multiline_promoted_properties_with_type_hints() {
++        let text = "<?php\nclass User {\n  public function __construct(\n    public string $email,\n    private ?User $owner\n  ) {}\n}\n";
++        let class_symbol = PhpSymbol {
++            name: "User".to_string(),
++            namespace: None,
++            kind: SymbolKind::CLASS,
++            parameters: Vec::new(),
++            return_type: None,
++            range: Range::new(Position::new(1, 6), Position::new(1, 10)),
++        };
++
++        let entries = collect_class_member_entries(text, &class_symbol);
++        assert!(entries
++            .iter()
++            .any(|e| e.label == "email" && e.type_hint.as_deref() == Some("string")));
++        assert!(entries
++            .iter()
++            .any(|e| e.label == "owner" && e.type_hint.as_deref() == Some("?User")));
++    }
++
++    #[tokio::test]
++    async fn completion_response_concretizes_member_type_from_template_argument() {
++        let captured_client = Arc::new(Mutex::new(None));
++        let captured_client_for_service = Arc::clone(&captured_client);
++        let (_service, _socket) = LspService::new(move |client| {
++            *captured_client_for_service
++                .lock()
++                .expect("client mutex") = Some(client.clone());
++            Backend {
++                client,
++                documents: RwLock::new(HashMap::new()),
++                symbols: RwLock::new(HashMap::new()),
++                workspace_folders: RwLock::new(Vec::new()),
++                open_documents: RwLock::new(HashSet::new()),
++                rename_prepare_contexts: RwLock::new(HashMap::new()),
++            }
++        });
++
++        let client = captured_client
++            .lock()
++            .expect("client mutex")
++            .take()
++            .expect("captured client");
++        let backend = Backend {
++            client,
++            documents: RwLock::new(HashMap::new()),
++            symbols: RwLock::new(HashMap::new()),
++            workspace_folders: RwLock::new(Vec::new()),
++            open_documents: RwLock::new(HashSet::new()),
++                rename_prepare_contexts: RwLock::new(HashMap::new()),
++        };
++
++        let uri = Url::parse("file:///tmp/member-type-generic.php").expect("uri");
++        let source = "<?php
++    /**
++     * @template TModel
++     */
++    class Repository {
++  public function first(): TModel {}
++}
++/** @var Repository<App\\Models\\User> $repo */
++$repo->fi
++";
++        backend.update_document(uri.clone(), source.to_string()).await;
++
++        let response = backend
++            .completion(CompletionParams {
++                text_document_position: TextDocumentPositionParams {
++                    text_document: TextDocumentIdentifier { uri: uri.clone() },
++                    position: Position::new(8, 8),
++                },
++                work_done_progress_params: Default::default(),
++                partial_result_params: Default::default(),
++                context: None,
++            })
++            .await
++            .expect("completion result")
++            .expect("completion response");
++
++        let items = match response {
++            tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
++            tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
++        };
++
++        let first_item = items
++            .iter()
++            .find(|item| {
++                item.label == "first"
++                    && item
++                        .data
++                        .as_ref()
++                        .and_then(|v| v.as_object())
++                        .and_then(|o| o.get("memberType"))
++                        .and_then(|v| v.as_str())
++                        .is_some()
++            })
++            .expect("first() member completion item");
++        assert_eq!(
++            first_item.detail.as_deref(),
++            Some("Instance member: App\\Models\\User")
++        );
++
++        let member_type = first_item
++            .data
++            .as_ref()
++            .and_then(|v| v.as_object())
++            .and_then(|o| o.get("memberType"))
++            .and_then(|v| v.as_str());
++        assert_eq!(member_type, Some("App\\Models\\User"));
++    }
++
++    #[tokio::test]
++    async fn completion_response_includes_instance_members_from_mixin_docblock() {
++        let captured_client = Arc::new(Mutex::new(None));
++        let captured_client_for_service = Arc::clone(&captured_client);
++        let (_service, _socket) = LspService::new(move |client| {
++            *captured_client_for_service
++                .lock()
++                .expect("client mutex") = Some(client.clone());
++            Backend {
++                client,
++                documents: RwLock::new(HashMap::new()),
++                symbols: RwLock::new(HashMap::new()),
++                workspace_folders: RwLock::new(Vec::new()),
++                open_documents: RwLock::new(HashSet::new()),
++                rename_prepare_contexts: RwLock::new(HashMap::new()),
++            }
++        });
++
++        let client = captured_client
++            .lock()
++            .expect("client mutex")
++            .take()
++            .expect("captured client");
++        let backend = Backend {
++            client,
++            documents: RwLock::new(HashMap::new()),
++            symbols: RwLock::new(HashMap::new()),
++            workspace_folders: RwLock::new(Vec::new()),
++            open_documents: RwLock::new(HashSet::new()),
++                rename_prepare_contexts: RwLock::new(HashMap::new()),
++        };
++
++        let uri = Url::parse("file:///tmp/mixin-completion.php").expect("uri");
++        let source = "<?php
++namespace App\\Core;
++
++class MagicMixin {
++  public function fromMixin(): string {}
++}
++
++/** @mixin App\\Core\\MagicMixin */
++class Repository {
++}
++
++$repo = new Repository();
++$repo->fr
++";
++        backend.update_document(uri.clone(), source.to_string()).await;
++
++        let response = backend
++            .completion(CompletionParams {
++                text_document_position: TextDocumentPositionParams {
++                    text_document: TextDocumentIdentifier { uri: uri.clone() },
++                    position: Position::new(12, 8),
++                },
++                work_done_progress_params: Default::default(),
++                partial_result_params: Default::default(),
++                context: None,
++            })
++            .await
++            .expect("completion result")
++            .expect("completion response");
++
++        let items = match response {
++            tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
++            tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
++        };
++
++        let mixin_item = items
++            .iter()
++            .find(|item| {
++                item.label == "fromMixin"
++                    && item
++                        .data
++                        .as_ref()
++                        .and_then(|v| v.as_object())
++                        .and_then(|o| o.get("memberOf"))
++                        .and_then(|v| v.as_str())
++                        == Some("App\\Core\\MagicMixin")
++            })
++            .expect("fromMixin member completion item");
++        assert_eq!(
++            mixin_item.detail.as_deref(),
++            Some("Instance member (mixin): string")
++        );
++        let member_of = mixin_item
++            .data
++            .as_ref()
++            .and_then(|v| v.as_object())
++            .and_then(|o| o.get("memberOf"))
++            .and_then(|v| v.as_str());
++        assert_eq!(member_of, Some("App\\Core\\MagicMixin"));
++    }
++
++    #[tokio::test]
++    async fn completion_response_adds_auto_import_with_alias_on_conflict() {
++        let captured_client = Arc::new(Mutex::new(None));
++        let captured_client_for_service = Arc::clone(&captured_client);
++        let (_service, _socket) = LspService::new(move |client| {
++            *captured_client_for_service
++                .lock()
++                .expect("client mutex") = Some(client.clone());
++            Backend {
++                client,
++                documents: RwLock::new(HashMap::new()),
++                symbols: RwLock::new(HashMap::new()),
++                workspace_folders: RwLock::new(Vec::new()),
++                open_documents: RwLock::new(HashSet::new()),
++                rename_prepare_contexts: RwLock::new(HashMap::new()),
++            }
++        });
++
++        let client = captured_client
++            .lock()
++            .expect("client mutex")
++            .take()
++            .expect("captured client");
++        let backend = Backend {
++            client,
++            documents: RwLock::new(HashMap::new()),
++            symbols: RwLock::new(HashMap::new()),
++            workspace_folders: RwLock::new(Vec::new()),
++            open_documents: RwLock::new(HashSet::new()),
++                rename_prepare_contexts: RwLock::new(HashMap::new()),
++        };
++
++        let current_uri = Url::parse("file:///tmp/auto-import-current.php").expect("current uri");
++        let current_source = "<?php
++namespace App\\Http\\Controllers;
++use App\\Models\\User;
++
++class Controller {
++  public function run() {
++    Us
++  }
++}
++";
++        backend
++            .update_document(current_uri.clone(), current_source.to_string())
++            .await;
++
++        let service_uri = Url::parse("file:///tmp/auto-import-service.php").expect("service uri");
++        let service_source = "<?php
++namespace App\\Services;
++
++class User {}
++";
++        backend
++            .update_document(service_uri, service_source.to_string())
++            .await;
++
++        let response = backend
++            .completion(CompletionParams {
++                text_document_position: TextDocumentPositionParams {
++                    text_document: TextDocumentIdentifier { uri: current_uri.clone() },
++                    position: Position::new(6, 6),
++                },
++                work_done_progress_params: Default::default(),
++                partial_result_params: Default::default(),
++                context: None,
++            })
++            .await
++            .expect("completion result")
++            .expect("completion response");
++
++        let items = match response {
++            tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
++            tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
++        };
++
++        let target = items
++            .iter()
++            .find(|item| {
++                item.data
++                    .as_ref()
++                    .and_then(|v| v.as_str())
++                    .map(|s| s == "App\\Services\\User")
++                    .unwrap_or(false)
++            })
++            .expect("App\\Services\\User completion item");
++
++        assert_eq!(target.insert_text.as_deref(), Some("UserAlias"));
++        let edits = target
++            .additional_text_edits
++            .as_ref()
++            .expect("additional text edits");
++        assert_eq!(edits.len(), 1);
++        assert_eq!(edits[0].new_text, "use App\\Services\\User as UserAlias;\n");
++    }
++
++    #[tokio::test]
++    async fn completion_response_suggests_blade_section_names_between_yield_and_section() {
++        let captured_client = Arc::new(Mutex::new(None));
++        let captured_client_for_service = Arc::clone(&captured_client);
++        let (_service, _socket) = LspService::new(move |client| {
++            *captured_client_for_service
++                .lock()
++                .expect("client mutex") = Some(client.clone());
++            Backend {
++                client,
++                documents: RwLock::new(HashMap::new()),
++                symbols: RwLock::new(HashMap::new()),
++                workspace_folders: RwLock::new(Vec::new()),
++                open_documents: RwLock::new(HashSet::new()),
++                rename_prepare_contexts: RwLock::new(HashMap::new()),
++            }
++        });
++
++        let client = captured_client
++            .lock()
++            .expect("client mutex")
++            .take()
++            .expect("captured client");
++        let backend = Backend {
++            client,
++            documents: RwLock::new(HashMap::new()),
++            symbols: RwLock::new(HashMap::new()),
++            workspace_folders: RwLock::new(Vec::new()),
++            open_documents: RwLock::new(HashSet::new()),
++                rename_prepare_contexts: RwLock::new(HashMap::new()),
++        };
++
++        let shared_uri = Url::parse("file:///tmp/layout.blade.php").expect("shared uri");
++        let shared_source = "@yield('content')\n";
++        backend
++            .update_document(shared_uri, shared_source.to_string())
++            .await;
++
++        let current_uri = Url::parse("file:///tmp/page.blade.php").expect("current uri");
++        let current_source = "@extends('layout')\n@section('co')\n";
++        backend
++            .update_document(current_uri.clone(), current_source.to_string())
++            .await;
++
++        let response = backend
++            .completion(CompletionParams {
++                text_document_position: TextDocumentPositionParams {
++                    text_document: TextDocumentIdentifier { uri: current_uri.clone() },
++                    position: Position::new(1, 12),
++                },
++                work_done_progress_params: Default::default(),
++                partial_result_params: Default::default(),
++                context: None,
++            })
++            .await
++            .expect("completion result")
++            .expect("completion response");
++
++        let items = match response {
++            tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
++            tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
++        };
++
++        let content_item = items
++            .iter()
++            .find(|item| item.label == "content")
++            .expect("content section completion");
++        assert_eq!(content_item.detail.as_deref(), Some("Blade section"));
++    }
++
++    #[tokio::test]
++    async fn completion_response_suggests_blade_section_names_with_dot_prefix() {
++        let captured_client = Arc::new(Mutex::new(None));
++        let captured_client_for_service = Arc::clone(&captured_client);
++        let (_service, _socket) = LspService::new(move |client| {
++            *captured_client_for_service
++                .lock()
++                .expect("client mutex") = Some(client.clone());
++            Backend {
++                client,
++                documents: RwLock::new(HashMap::new()),
++                symbols: RwLock::new(HashMap::new()),
++                workspace_folders: RwLock::new(Vec::new()),
++                open_documents: RwLock::new(HashSet::new()),
++                rename_prepare_contexts: RwLock::new(HashMap::new()),
++            }
++        });
++
++        let client = captured_client
++            .lock()
++            .expect("client mutex")
++            .take()
++            .expect("captured client");
++        let backend = Backend {
++            client,
++            documents: RwLock::new(HashMap::new()),
++            symbols: RwLock::new(HashMap::new()),
++            workspace_folders: RwLock::new(Vec::new()),
++            open_documents: RwLock::new(HashSet::new()),
++                rename_prepare_contexts: RwLock::new(HashMap::new()),
++        };
++
++        let shared_uri = Url::parse("file:///tmp/layout.blade.php").expect("shared uri");
++        let shared_source = "@yield('layout.content')\n";
++        backend
++            .update_document(shared_uri, shared_source.to_string())
++            .await;
++
++        let current_uri = Url::parse("file:///tmp/page.blade.php").expect("current uri");
++        let current_source = "@extends('layout')\n@section('layout.co')\n";
++        backend
++            .update_document(current_uri.clone(), current_source.to_string())
++            .await;
++
++        let response = backend
++            .completion(CompletionParams {
++                text_document_position: TextDocumentPositionParams {
++                    text_document: TextDocumentIdentifier { uri: current_uri.clone() },
++                    position: Position::new(1, 19),
++                },
++                work_done_progress_params: Default::default(),
++                partial_result_params: Default::default(),
++                context: None,
++            })
++            .await
++            .expect("completion result")
++            .expect("completion response");
++
++        let items = match response {
++            tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
++            tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
++        };
++
++        let content_item = items
++            .iter()
++            .find(|item| item.label == "layout.content")
++            .expect("layout.content section completion");
++        assert_eq!(content_item.detail.as_deref(), Some("Blade section"));
++    }
++
++    #[tokio::test]
++    async fn completion_response_suggests_blade_view_ids_in_include_and_view_calls() {
++        let captured_client = Arc::new(Mutex::new(None));
++        let captured_client_for_service = Arc::clone(&captured_client);
++        let (_service, _socket) = LspService::new(move |client| {
++            *captured_client_for_service
++                .lock()
++                .expect("client mutex") = Some(client.clone());
++            Backend {
++                client,
++                documents: RwLock::new(HashMap::new()),
++                symbols: RwLock::new(HashMap::new()),
++                workspace_folders: RwLock::new(Vec::new()),
++                open_documents: RwLock::new(HashSet::new()),
++                rename_prepare_contexts: RwLock::new(HashMap::new()),
++            }
++        });
++
++        let client = captured_client
++            .lock()
++            .expect("client mutex")
++            .take()
++            .expect("captured client");
++        let backend = Backend {
++            client,
++            documents: RwLock::new(HashMap::new()),
++            symbols: RwLock::new(HashMap::new()),
++            workspace_folders: RwLock::new(Vec::new()),
++            open_documents: RwLock::new(HashSet::new()),
++                rename_prepare_contexts: RwLock::new(HashMap::new()),
++        };
++
++        backend
++            .update_document(
++                Url::parse("file:///tmp/resources/views/admin/users/index.blade.php")
++                    .expect("view uri"),
++                "<h1>Users</h1>".to_string(),
++            )
++            .await;
++        backend
++            .update_document(
++                Url::parse("file:///tmp/resources/views/layouts/app.blade.php").expect("layout uri"),
++                "<h1>Layout</h1>".to_string(),
++            )
++            .await;
++
++        let include_uri = Url::parse("file:///tmp/resources/views/page.blade.php").expect("include uri");
++        backend
++            .update_document(include_uri.clone(), "@include('admin.u')\n".to_string())
++            .await;
++
++        let include_response = backend
++            .completion(CompletionParams {
++                text_document_position: TextDocumentPositionParams {
++                    text_document: TextDocumentIdentifier {
++                        uri: include_uri.clone(),
++                    },
++                    position: Position::new(0, 17),
++                },
++                work_done_progress_params: Default::default(),
++                partial_result_params: Default::default(),
++                context: None,
++            })
++            .await
++            .expect("include completion result")
++            .expect("include completion response");
++
++        let include_items = match include_response {
++            tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
++            tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
++        };
++        let include_item = include_items
++            .iter()
++            .find(|item| item.label == "admin.users.index")
++            .expect("blade view completion for include");
++        assert_eq!(include_item.detail.as_deref(), Some("Blade view"));
++
++        let php_uri = Url::parse("file:///tmp/controller.php").expect("php uri");
++        backend
++            .update_document(php_uri.clone(), "<?php\nview('layouts.ap');\n".to_string())
++            .await;
++        let php_response = backend
++            .completion(CompletionParams {
++                text_document_position: TextDocumentPositionParams {
++                    text_document: TextDocumentIdentifier { uri: php_uri.clone() },
++                    position: Position::new(1, 16),
++                },
++                work_done_progress_params: Default::default(),
++                partial_result_params: Default::default(),
++                context: None,
++            })
++            .await
++            .expect("php view completion result")
++            .expect("php view completion response");
++        let php_items = match php_response {
++            tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
++            tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
++        };
++        assert!(php_items
++            .iter()
++            .any(|item| item.label == "layouts.app" && item.detail.as_deref() == Some("Blade view")));
++    }
++
++    #[tokio::test]
++    async fn completion_response_suggests_x_and_livewire_tags_and_attributes() {
++        let captured_client = Arc::new(Mutex::new(None));
++        let captured_client_for_service = Arc::clone(&captured_client);
++        let (_service, _socket) = LspService::new(move |client| {
++            *captured_client_for_service
++                .lock()
++                .expect("client mutex") = Some(client.clone());
++            Backend {
++                client,
++                documents: RwLock::new(HashMap::new()),
++                symbols: RwLock::new(HashMap::new()),
++                workspace_folders: RwLock::new(Vec::new()),
++                open_documents: RwLock::new(HashSet::new()),
++                rename_prepare_contexts: RwLock::new(HashMap::new()),
++            }
++        });
++
++        let client = captured_client
++            .lock()
++            .expect("client mutex")
++            .take()
++            .expect("captured client");
++        let backend = Backend {
++            client,
++            documents: RwLock::new(HashMap::new()),
++            symbols: RwLock::new(HashMap::new()),
++            workspace_folders: RwLock::new(Vec::new()),
++            open_documents: RwLock::new(HashSet::new()),
++                rename_prepare_contexts: RwLock::new(HashMap::new()),
++        };
++
++        backend
++            .update_document(
++                Url::parse("file:///tmp/resources/views/components/alerts/error.blade.php")
++                    .expect("component uri"),
++                "<div>{{ $slot }}</div>".to_string(),
++            )
++            .await;
++        backend
++            .update_document(
++                Url::parse("file:///tmp/resources/views/observed.blade.php").expect("observed uri"),
++                "<livewire:posts-table wire:model=\"search\" wire:click=\"refresh\" />\n<x-alerts.error class=\"mb-2\" :theme=\"$theme\" />".to_string(),
++            )
++            .await;
++
++        let tag_uri = Url::parse("file:///tmp/resources/views/current.blade.php").expect("tag uri");
++        backend
++            .update_document(tag_uri.clone(), "<x-ale\n".to_string())
++            .await;
++
++        let x_tag_response = backend
++            .completion(CompletionParams {
++                text_document_position: TextDocumentPositionParams {
++                    text_document: TextDocumentIdentifier { uri: tag_uri.clone() },
++                    position: Position::new(0, 6),
++                },
++                work_done_progress_params: Default::default(),
++                partial_result_params: Default::default(),
++                context: None,
++            })
++            .await
++            .expect("x-tag completion result")
++            .expect("x-tag completion response");
++        let x_tag_items = match x_tag_response {
++            tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
++            tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
++        };
++        let x_item = x_tag_items
++            .iter()
++            .find(|item| item.label == "x-alerts.error")
++            .expect("x-tag completion");
++        assert_eq!(x_item.detail.as_deref(), Some("Blade component tag"));
++
++        backend
++            .update_document(tag_uri.clone(), "<livewire:posts-\n".to_string())
++            .await;
++        let livewire_response = backend
++            .completion(CompletionParams {
++                text_document_position: TextDocumentPositionParams {
++                    text_document: TextDocumentIdentifier { uri: tag_uri.clone() },
++                    position: Position::new(0, 16),
++                },
++                work_done_progress_params: Default::default(),
++                partial_result_params: Default::default(),
++                context: None,
++            })
++            .await
++            .expect("livewire completion result")
++            .expect("livewire completion response");
++        let livewire_items = match livewire_response {
++            tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
++            tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
++        };
++        let lw_item = livewire_items
+             .iter()
+-            .any(|e| e.label == "id" && !e.is_static && e.type_hint.as_deref() == Some("int")));
+-    }
++            .find(|item| item.label == "livewire:posts-table")
++            .expect("livewire tag completion");
++        assert_eq!(lw_item.detail.as_deref(), Some("Livewire component"));
+ 
+-    #[test]
+-    fn marks_multiline_promoted_properties_with_type_hints() {
+-        let text = "<?php\nclass User {\n  public function __construct(\n    public string $email,\n    private ?User $owner\n  ) {}\n}\n";
+-        let class_symbol = PhpSymbol {
+-            name: "User".to_string(),
+-            namespace: None,
+-            kind: SymbolKind::CLASS,
+-            parameters: Vec::new(),
+-            return_type: None,
+-            range: Range::new(Position::new(1, 6), Position::new(1, 10)),
++        backend
++            .update_document(tag_uri.clone(), "<x-alerts.error :t\n".to_string())
++            .await;
++        let x_attr_response = backend
++            .completion(CompletionParams {
++                text_document_position: TextDocumentPositionParams {
++                    text_document: TextDocumentIdentifier { uri: tag_uri.clone() },
++                    position: Position::new(0, 17),
++                },
++                work_done_progress_params: Default::default(),
++                partial_result_params: Default::default(),
++                context: None,
++            })
++            .await
++            .expect("x-attr completion result")
++            .expect("x-attr completion response");
++        let x_attr_items = match x_attr_response {
++            tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
++            tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
+         };
+-
+-        let entries = collect_class_member_entries(text, &class_symbol);
+-        assert!(entries
++        assert!(x_attr_items
+             .iter()
+-            .any(|e| e.label == "email" && e.type_hint.as_deref() == Some("string")));
+-        assert!(entries
++            .any(|item| item.label == ":theme" && item.detail.as_deref() == Some("Blade attribute")));
++
++        backend
++            .update_document(tag_uri.clone(), "<livewire:posts-table wire:\n".to_string())
++            .await;
++        let lw_attr_response = backend
++            .completion(CompletionParams {
++                text_document_position: TextDocumentPositionParams {
++                    text_document: TextDocumentIdentifier { uri: tag_uri.clone() },
++                    position: Position::new(0, 27),
++                },
++                work_done_progress_params: Default::default(),
++                partial_result_params: Default::default(),
++                context: None,
++            })
++            .await
++            .expect("livewire attr completion result")
++            .expect("livewire attr completion response");
++        let lw_attr_items = match lw_attr_response {
++            tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
++            tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
++        };
++        assert!(lw_attr_items
+             .iter()
+-            .any(|e| e.label == "owner" && e.type_hint.as_deref() == Some("?User")));
++            .any(|item| item.label == "wire:model" && item.detail.as_deref() == Some("Blade attribute")));
+     }
+ 
+     #[tokio::test]
+-    async fn completion_response_concretizes_member_type_from_template_argument() {
++    async fn completion_response_suggests_livewire_actions_and_properties_in_wire_values() {
+         let captured_client = Arc::new(Mutex::new(None));
+         let captured_client_for_service = Arc::clone(&captured_client);
+         let (_service, _socket) = LspService::new(move |client| {
+@@ -1191,6 +2662,7 @@ use super::{
+                 symbols: RwLock::new(HashMap::new()),
+                 workspace_folders: RwLock::new(Vec::new()),
+                 open_documents: RwLock::new(HashSet::new()),
++                rename_prepare_contexts: RwLock::new(HashMap::new()),
+             }
+         });
+ 
+@@ -1205,69 +2677,88 @@ use super::{
+             symbols: RwLock::new(HashMap::new()),
+             workspace_folders: RwLock::new(Vec::new()),
+             open_documents: RwLock::new(HashSet::new()),
++                rename_prepare_contexts: RwLock::new(HashMap::new()),
+         };
+ 
+-        let uri = Url::parse("file:///tmp/member-type-generic.php").expect("uri");
+-        let source = "<?php
+-    /**
+-     * @template TModel
+-     */
+-    class Repository {
+-  public function first(): TModel {}
+-}
+-/** @var Repository<App\\Models\\User> $repo */
+-$repo->fi
+-";
+-        backend.update_document(uri.clone(), source.to_string()).await;
++        backend
++            .update_document(
++                Url::parse("file:///tmp/app/Livewire/PostsTable.php").expect("livewire class uri"),
++                "<?php\nnamespace App\\Livewire;\n\nclass PostsTable extends Component\n{\n    public string $search = '';\n    protected string $hidden = '';\n\n    public function mount() {}\n    public function refresh() {}\n    public function archivePost(int $id) {}\n}\n".to_string(),
++            )
++            .await;
++        backend
++            .update_document(
++                Url::parse("file:///tmp/app/Services/PostsTable.php").expect("non livewire class uri"),
++                "<?php\nnamespace App\\Services;\n\nclass PostsTable\n{\n    public function serviceOnlyAction() {}\n    public string $serviceOnlyState = '';\n}\n".to_string(),
++            )
++            .await;
+ 
+-        let response = backend
++        let blade_uri = Url::parse("file:///tmp/resources/views/current.blade.php").expect("blade uri");
++        backend
++            .update_document(
++                blade_uri.clone(),
++                "<livewire:posts-table wire:click=\"\" wire:model=\"\" />".to_string(),
++            )
++            .await;
++
++        let click_response = backend
+             .completion(CompletionParams {
+                 text_document_position: TextDocumentPositionParams {
+-                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+-                    position: Position::new(8, 8),
++                    text_document: TextDocumentIdentifier {
++                        uri: blade_uri.clone(),
++                    },
++                    position: Position::new(0, 34),
+                 },
+                 work_done_progress_params: Default::default(),
+                 partial_result_params: Default::default(),
+                 context: None,
+             })
+             .await
+-            .expect("completion result")
+-            .expect("completion response");
+-
+-        let items = match response {
++            .expect("click completion result")
++            .expect("click completion response");
++        let click_items = match click_response {
+             tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
+             tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
+         };
+-
+-        let first_item = items
++        assert!(click_items
+             .iter()
+-            .find(|item| {
+-                item.label == "first"
+-                    && item
+-                        .data
+-                        .as_ref()
+-                        .and_then(|v| v.as_object())
+-                        .and_then(|o| o.get("memberType"))
+-                        .and_then(|v| v.as_str())
+-                        .is_some()
+-            })
+-            .expect("first() member completion item");
+-        assert_eq!(
+-            first_item.detail.as_deref(),
+-            Some("Instance member: App\\Models\\User")
+-        );
++            .any(|item| item.label == "refresh" && item.detail.as_deref() == Some("Livewire action")));
++        assert!(click_items
++            .iter()
++            .any(|item| item.label == "archivePost" && item.detail.as_deref() == Some("Livewire action")));
++        assert!(!click_items
++            .iter()
++            .any(|item| item.label == "mount" && item.detail.as_deref() == Some("Livewire action")));
++        assert!(!click_items.iter().any(|item| item.label == "serviceOnlyAction"));
+ 
+-        let member_type = first_item
+-            .data
+-            .as_ref()
+-            .and_then(|v| v.as_object())
+-            .and_then(|o| o.get("memberType"))
+-            .and_then(|v| v.as_str());
+-        assert_eq!(member_type, Some("App\\Models\\User"));
++        let model_response = backend
++            .completion(CompletionParams {
++                text_document_position: TextDocumentPositionParams {
++                    text_document: TextDocumentIdentifier { uri: blade_uri },
++                    position: Position::new(0, 48),
++                },
++                work_done_progress_params: Default::default(),
++                partial_result_params: Default::default(),
++                context: None,
++            })
++            .await
++            .expect("model completion result")
++            .expect("model completion response");
++        let model_items = match model_response {
++            tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
++            tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
++        };
++        assert!(model_items
++            .iter()
++            .any(|item| item.label == "search" && item.detail.as_deref() == Some("Livewire property")));
++        assert!(!model_items
++            .iter()
++            .any(|item| item.label == "hidden" && item.detail.as_deref() == Some("Livewire property")));
++        assert!(!model_items.iter().any(|item| item.label == "serviceOnlyState"));
+     }
+ 
+     #[tokio::test]
+-    async fn completion_response_includes_instance_members_from_mixin_docblock() {
++    async fn completion_response_suggests_blade_component_variables() {
+         let captured_client = Arc::new(Mutex::new(None));
+         let captured_client_for_service = Arc::clone(&captured_client);
+         let (_service, _socket) = LspService::new(move |client| {
+@@ -1280,6 +2771,7 @@ $repo->fi
+                 symbols: RwLock::new(HashMap::new()),
+                 workspace_folders: RwLock::new(Vec::new()),
+                 open_documents: RwLock::new(HashSet::new()),
++                rename_prepare_contexts: RwLock::new(HashMap::new()),
+             }
+         });
+ 
+@@ -1294,72 +2786,49 @@ $repo->fi
+             symbols: RwLock::new(HashMap::new()),
+             workspace_folders: RwLock::new(Vec::new()),
+             open_documents: RwLock::new(HashSet::new()),
++                rename_prepare_contexts: RwLock::new(HashMap::new()),
+         };
+ 
+-        let uri = Url::parse("file:///tmp/mixin-completion.php").expect("uri");
+-        let source = "<?php
+-namespace App\\Core;
+-
+-class MagicMixin {
+-  public function fromMixin(): string {}
+-}
+-
+-/** @mixin App\\Core\\MagicMixin */
+-class Repository {
+-}
+-
+-$repo = new Repository();
+-$repo->fr
+-";
+-        backend.update_document(uri.clone(), source.to_string()).await;
++        backend
++            .update_document(
++                Url::parse("file:///tmp/resources/views/shared.blade.php").expect("shared uri"),
++                "{{ $pageTitle }} {{ $attributes }}".to_string(),
++            )
++            .await;
++        let current_uri = Url::parse("file:///tmp/resources/views/page.blade.php").expect("current uri");
++        backend
++            .update_document(current_uri.clone(), "{{ $at }}".to_string())
++            .await;
+ 
+         let response = backend
+             .completion(CompletionParams {
+                 text_document_position: TextDocumentPositionParams {
+-                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+-                    position: Position::new(12, 8),
++                    text_document: TextDocumentIdentifier {
++                        uri: current_uri.clone(),
++                    },
++                    position: Position::new(0, 6),
+                 },
+                 work_done_progress_params: Default::default(),
+                 partial_result_params: Default::default(),
+                 context: None,
+             })
+             .await
+-            .expect("completion result")
+-            .expect("completion response");
+-
++            .expect("blade variable completion result")
++            .expect("blade variable completion response");
+         let items = match response {
+             tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
+             tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
+         };
+ 
+-        let mixin_item = items
++        let attributes = items
+             .iter()
+-            .find(|item| {
+-                item.label == "fromMixin"
+-                    && item
+-                        .data
+-                        .as_ref()
+-                        .and_then(|v| v.as_object())
+-                        .and_then(|o| o.get("memberOf"))
+-                        .and_then(|v| v.as_str())
+-                        == Some("App\\Core\\MagicMixin")
+-            })
+-            .expect("fromMixin member completion item");
+-        assert_eq!(
+-            mixin_item.detail.as_deref(),
+-            Some("Instance member (mixin): string")
+-        );
+-        let member_of = mixin_item
+-            .data
+-            .as_ref()
+-            .and_then(|v| v.as_object())
+-            .and_then(|o| o.get("memberOf"))
+-            .and_then(|v| v.as_str());
+-        assert_eq!(member_of, Some("App\\Core\\MagicMixin"));
++            .find(|item| item.label == "$attributes")
++            .expect("$attributes completion");
++        assert_eq!(attributes.detail.as_deref(), Some("Blade variable"));
+     }
+ 
+     #[tokio::test]
+-    async fn completion_response_adds_auto_import_with_alias_on_conflict() {
++    async fn completion_response_includes_ide_json_custom_entries_for_blade() {
+         let captured_client = Arc::new(Mutex::new(None));
+         let captured_client_for_service = Arc::clone(&captured_client);
+         let (_service, _socket) = LspService::new(move |client| {
+@@ -1372,6 +2841,7 @@ $repo->fr
+                 symbols: RwLock::new(HashMap::new()),
+                 workspace_folders: RwLock::new(Vec::new()),
+                 open_documents: RwLock::new(HashSet::new()),
++                rename_prepare_contexts: RwLock::new(HashMap::new()),
+             }
+         });
+ 
+@@ -1386,38 +2856,31 @@ $repo->fr
+             symbols: RwLock::new(HashMap::new()),
+             workspace_folders: RwLock::new(Vec::new()),
+             open_documents: RwLock::new(HashSet::new()),
++                rename_prepare_contexts: RwLock::new(HashMap::new()),
+         };
+ 
+-        let current_uri = Url::parse("file:///tmp/auto-import-current.php").expect("current uri");
+-        let current_source = "<?php
+-namespace App\\Http\\Controllers;
+-use App\\Models\\User;
+-
+-class Controller {
+-  public function run() {
+-    Us
++        let ide_uri = Url::parse("file:///tmp/ide.json").expect("ide uri");
++        let ide_source = r#"{
++  "completions": ["tenantScope"],
++  "blade": {
++    "directives": ["tenant"],
++    "components": {"alert": {}, "x-banner": {}}
+   }
+-}
+-";
++}"#;
+         backend
+-            .update_document(current_uri.clone(), current_source.to_string())
++            .update_document(ide_uri, ide_source.to_string())
+             .await;
+ 
+-        let service_uri = Url::parse("file:///tmp/auto-import-service.php").expect("service uri");
+-        let service_source = "<?php
+-namespace App\\Services;
+-
+-class User {}
+-";
++        let blade_uri = Url::parse("file:///tmp/page.blade.php").expect("blade uri");
+         backend
+-            .update_document(service_uri, service_source.to_string())
++            .update_document(blade_uri.clone(), "@".to_string())
+             .await;
+ 
+         let response = backend
+             .completion(CompletionParams {
+                 text_document_position: TextDocumentPositionParams {
+-                    text_document: TextDocumentIdentifier { uri: current_uri.clone() },
+-                    position: Position::new(6, 6),
++                    text_document: TextDocumentIdentifier { uri: blade_uri.clone() },
++                    position: Position::new(0, 1),
+                 },
+                 work_done_progress_params: Default::default(),
+                 partial_result_params: Default::default(),
+@@ -1432,28 +2895,21 @@ class User {}
+             tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
+         };
+ 
+-        let target = items
++        assert!(items.iter().any(|item| item.label == "tenantScope"));
++        let directive = items
+             .iter()
+-            .find(|item| {
+-                item.data
+-                    .as_ref()
+-                    .and_then(|v| v.as_str())
+-                    .map(|s| s == "App\\Services\\User")
+-                    .unwrap_or(false)
+-            })
+-            .expect("App\\Services\\User completion item");
+-
+-        assert_eq!(target.insert_text.as_deref(), Some("UserAlias"));
+-        let edits = target
+-            .additional_text_edits
+-            .as_ref()
+-            .expect("additional text edits");
+-        assert_eq!(edits.len(), 1);
+-        assert_eq!(edits[0].new_text, "use App\\Services\\User as UserAlias;\n");
++            .find(|item| item.label == "@tenant")
++            .expect("custom blade directive completion");
++        assert_eq!(directive.detail.as_deref(), Some("Laravel ide.json directive"));
++        let component = items
++            .iter()
++            .find(|item| item.label == "x-alert")
++            .expect("custom blade component completion");
++        assert_eq!(component.detail.as_deref(), Some("Laravel ide.json component"));
+     }
+ 
+     #[tokio::test]
+-    async fn completion_response_suggests_blade_section_names_between_yield_and_section() {
++    async fn completion_response_excludes_blade_only_ide_json_entries_for_php_context() {
+         let captured_client = Arc::new(Mutex::new(None));
+         let captured_client_for_service = Arc::clone(&captured_client);
+         let (_service, _socket) = LspService::new(move |client| {
+@@ -1466,6 +2922,7 @@ class User {}
+                 symbols: RwLock::new(HashMap::new()),
+                 workspace_folders: RwLock::new(Vec::new()),
+                 open_documents: RwLock::new(HashSet::new()),
++                rename_prepare_contexts: RwLock::new(HashMap::new()),
+             }
+         });
+ 
+@@ -1480,25 +2937,31 @@ class User {}
+             symbols: RwLock::new(HashMap::new()),
+             workspace_folders: RwLock::new(Vec::new()),
+             open_documents: RwLock::new(HashSet::new()),
++                rename_prepare_contexts: RwLock::new(HashMap::new()),
+         };
+ 
+-        let shared_uri = Url::parse("file:///tmp/layout.blade.php").expect("shared uri");
+-        let shared_source = "@yield('content')\n";
++        let ide_uri = Url::parse("file:///tmp/ide.json").expect("ide uri");
++        let ide_source = r#"{
++  "completions": ["tenantScope"],
++  "blade": {
++    "directives": ["tenant"],
++    "components": {"alert": {}, "x-banner": {}}
++  }
++}"#;
+         backend
+-            .update_document(shared_uri, shared_source.to_string())
++            .update_document(ide_uri, ide_source.to_string())
+             .await;
+ 
+-        let current_uri = Url::parse("file:///tmp/page.blade.php").expect("current uri");
+-        let current_source = "@extends('layout')\n@section('co')\n";
++        let php_uri = Url::parse("file:///tmp/page.php").expect("php uri");
+         backend
+-            .update_document(current_uri.clone(), current_source.to_string())
++            .update_document(php_uri.clone(), "<?php\nten".to_string())
+             .await;
+ 
+         let response = backend
+             .completion(CompletionParams {
+                 text_document_position: TextDocumentPositionParams {
+-                    text_document: TextDocumentIdentifier { uri: current_uri.clone() },
+-                    position: Position::new(1, 12),
++                    text_document: TextDocumentIdentifier { uri: php_uri.clone() },
++                    position: Position::new(1, 3),
+                 },
+                 work_done_progress_params: Default::default(),
+                 partial_result_params: Default::default(),
+@@ -1513,11 +2976,9 @@ class User {}
+             tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
+         };
+ 
+-        let content_item = items
+-            .iter()
+-            .find(|item| item.label == "content")
+-            .expect("content section completion");
+-        assert_eq!(content_item.detail.as_deref(), Some("Blade section"));
++        assert!(items.iter().any(|item| item.label == "tenantScope"));
++        assert!(!items.iter().any(|item| item.label == "@tenant"));
++        assert!(!items.iter().any(|item| item.label == "x-alert"));
+     }
+ 
+     #[test]
+@@ -3110,6 +4571,103 @@ class User {}
+         assert_eq!(output, "<?php\n\n\necho 'x';\n");
+     }
+ 
++    fn formatter_env_lock() -> &'static Mutex<()> {
++        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
++        LOCK.get_or_init(|| Mutex::new(()))
++    }
++
++    fn with_formatter_env_vars(vars: &[(&str, Option<&str>)], test: impl FnOnce()) {
++        let _guard = formatter_env_lock().lock().expect("formatter env lock");
++        let previous = vars
++            .iter()
++            .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
++            .collect::<Vec<_>>();
++
++        for (key, value) in vars {
++            match value {
++                Some(v) => std::env::set_var(key, v),
++                None => std::env::remove_var(key),
++            }
++        }
++
++        test();
++
++        for (key, value) in previous {
++            match value {
++                Some(v) => std::env::set_var(key, v),
++                None => std::env::remove_var(key),
++            }
++        }
++    }
++
++    #[test]
++    fn format_document_wordpress_preset_limits_blank_lines_to_one() {
++        with_formatter_env_vars(
++            &[
++                ("VSCODE_LS_PHP_FORMAT_STYLE_PRESET", Some("WordPress")),
++                ("VSCODE_LS_PHP_FORMAT_MAX_BLANK_LINES", None),
++                ("VSCODE_LS_PHP_FORMAT_BLADE_DIRECTIVE_SPACING", None),
++                ("VSCODE_LS_PHP_FORMAT_TRIM_TRAILING_WHITESPACE", None),
++            ],
++            || {
++                let input = "<?php\necho 'a';\n\n\n\necho 'b';\n";
++                let output = format_document(input);
++                assert_eq!(output, "<?php\necho 'a';\n\necho 'b';\n");
++            },
++        );
++    }
++
++    #[test]
++    fn format_document_uses_custom_max_blank_lines_and_blade_spacing_toggle() {
++        with_formatter_env_vars(
++            &[
++                ("VSCODE_LS_PHP_FORMAT_STYLE_PRESET", Some("default")),
++                ("VSCODE_LS_PHP_FORMAT_MAX_BLANK_LINES", Some("0")),
++                ("VSCODE_LS_PHP_FORMAT_BLADE_DIRECTIVE_SPACING", Some("false")),
++                ("VSCODE_LS_PHP_FORMAT_TRIM_TRAILING_WHITESPACE", Some("true")),
++            ],
++            || {
++                let input = "@if($ok)\n\n\n\n@endif\n";
++                let output = format_document(input);
++                assert_eq!(output, "@if($ok)\n@endif\n");
++            },
++        );
++    }
++
++    #[test]
++    fn format_document_custom_max_blank_lines_overrides_wordpress_preset() {
++        with_formatter_env_vars(
++            &[
++                ("VSCODE_LS_PHP_FORMAT_STYLE_PRESET", Some("WordPress")),
++                ("VSCODE_LS_PHP_FORMAT_MAX_BLANK_LINES", Some("3")),
++                ("VSCODE_LS_PHP_FORMAT_BLADE_DIRECTIVE_SPACING", None),
++                ("VSCODE_LS_PHP_FORMAT_TRIM_TRAILING_WHITESPACE", None),
++            ],
++            || {
++                let input = "<?php\necho 'a';\n\n\n\n\necho 'b';\n";
++                let output = format_document(input);
++                assert_eq!(output, "<?php\necho 'a';\n\n\n\necho 'b';\n");
++            },
++        );
++    }
++
++    #[test]
++    fn format_document_respects_trim_trailing_whitespace_toggle() {
++        with_formatter_env_vars(
++            &[
++                ("VSCODE_LS_PHP_FORMAT_STYLE_PRESET", Some("default")),
++                ("VSCODE_LS_PHP_FORMAT_MAX_BLANK_LINES", None),
++                ("VSCODE_LS_PHP_FORMAT_BLADE_DIRECTIVE_SPACING", None),
++                ("VSCODE_LS_PHP_FORMAT_TRIM_TRAILING_WHITESPACE", Some("false")),
++            ],
++            || {
++                let input = "<?php\necho 'x';   \n";
++                let output = format_document(input);
++                assert_eq!(output, "<?php\necho 'x';   \n");
++            },
++        );
++    }
++
+     #[test]
+     fn builds_var_dump_delete_action_for_debug_diagnostic() {
+         let text = "<?php\nvar_dump($x);\n$y = 1;\n";
+@@ -3835,3 +5393,4 @@ fn builds_range_formatting_edit_for_selected_lines() {
+         assert_eq!(hints[0].2, "left:");
+         assert_eq!(hints[1].2, "right:");
+     }
++

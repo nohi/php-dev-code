@@ -21,6 +21,10 @@ pub(crate) fn collect_php_files(root: &Path, out: &mut Vec<PathBuf>) {
             .extension()
             .and_then(|ext| ext.to_str())
             .is_some_and(|ext| ext.eq_ignore_ascii_case("php"))
+            || path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("ide.json"))
         {
             out.push(path);
         }
@@ -37,7 +41,37 @@ pub(crate) fn should_skip_dir(path: &Path) -> bool {
 
 pub(crate) fn is_php_uri(uri: &Url) -> bool {
     let path = uri.path().to_ascii_lowercase();
-    path.ends_with(".php") || path.ends_with(".blade.php")
+    if path.ends_with(".php") || path.ends_with(".blade.php") {
+        return true;
+    }
+
+    is_phar_uri(uri)
+        && path
+            .split('/')
+            .any(|segment| segment.ends_with(".php") || segment.ends_with(".blade.php"))
+}
+
+pub(crate) fn is_ide_json_uri(uri: &Url) -> bool {
+    uri.path().to_ascii_lowercase().ends_with("/ide.json")
+}
+
+pub(crate) fn is_indexed_uri(uri: &Url) -> bool {
+    is_php_uri(uri) || is_ide_json_uri(uri)
+}
+
+pub(crate) fn is_phar_uri(uri: &Url) -> bool {
+    if uri.scheme().eq_ignore_ascii_case("phar") {
+        return true;
+    }
+
+    if !uri.scheme().eq_ignore_ascii_case("file") {
+        return false;
+    }
+
+    uri.path()
+        .split('/')
+        .map(|segment| segment.to_ascii_lowercase())
+        .any(|segment| segment.ends_with(".phar"))
 }
 
 pub(crate) fn is_blade_uri(uri: &Url) -> bool {

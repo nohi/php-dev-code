@@ -7,17 +7,47 @@ const { promisify } = require("node:util");
 
 const execFileAsync = promisify(execFile);
 
+function printHelp() {
+  process.stdout.write(`Usage: node scripts/lsp-benchmark.js [options]
+
+Options:
+  --server <path>                                Path to LSP server binary
+  --workspace <path>                             Workspace path to benchmark
+  --output <path>                                Write benchmark JSON to file
+  --fail-on-threshold                            Exit non-zero on threshold violations
+  --completion-runs <number>                     Completion sample count (default: 60)
+  --hover-runs <number>                          Hover sample count (default: 60)
+  --warmup-runs <number>                         Warmup iterations (default: 10)
+  --max-completion-p95-ms <number>               Absolute completion p95 threshold (default: 30)
+  --max-hover-p95-ms <number>                    Absolute hover p95 threshold (default: 20)
+  --max-index-ms <number>                        Absolute index duration threshold (default: env VSCODE_LS_PHP_INDEX_TARGET_MS or disabled)
+  --index-timeout-ms <number>                    Index observation timeout (default: 30000)
+  --baseline <path>                              Baseline benchmark JSON for regression deltas
+  --max-completion-p95-regression-ms <number>    Allowed completion p95 regression vs baseline (default: 5)
+  --max-hover-p95-regression-ms <number>         Allowed hover p95 regression vs baseline (default: 5)
+  --max-index-regression-ms <number>             Allowed index duration regression vs baseline (default: 1000)
+  --require-baseline                             Fail when baseline cannot be loaded
+  --help                                         Show this help text
+`);
+}
+
 function parseArgs(argv) {
   const result = {
     server: null,
     workspace: null,
     output: null,
+    baseline: null,
     failOnThreshold: false,
+    requireBaseline: false,
+    help: false,
     completionRuns: 60,
     hoverRuns: 60,
     warmupRuns: 10,
     maxCompletionP95Ms: 30,
     maxHoverP95Ms: 20,
+    maxCompletionP95RegressionMs: 5,
+    maxHoverP95RegressionMs: 5,
+    maxIndexRegressionMs: 1000,
     maxIndexMs: process.env.VSCODE_LS_PHP_INDEX_TARGET_MS
       ? Number(process.env.VSCODE_LS_PHP_INDEX_TARGET_MS)
       : 0,
@@ -28,6 +58,14 @@ function parseArgs(argv) {
     const arg = argv[i];
     if (arg === "--fail-on-threshold") {
       result.failOnThreshold = true;
+      continue;
+    }
+    if (arg === "--require-baseline") {
+      result.requireBaseline = true;
+      continue;
+    }
+    if (arg === "--help") {
+      result.help = true;
       continue;
     }
     const next = argv[i + 1];
@@ -45,6 +83,9 @@ function parseArgs(argv) {
         break;
       case "--output":
         result.output = next;
+        break;
+      case "--baseline":
+        result.baseline = next;
         break;
       case "--completion-runs":
         result.completionRuns = Number(next);
@@ -66,6 +107,15 @@ function parseArgs(argv) {
         break;
       case "--index-timeout-ms":
         result.indexTimeoutMs = Number(next);
+        break;
+      case "--max-completion-p95-regression-ms":
+        result.maxCompletionP95RegressionMs = Number(next);
+        break;
+      case "--max-hover-p95-regression-ms":
+        result.maxHoverP95RegressionMs = Number(next);
+        break;
+      case "--max-index-regression-ms":
+        result.maxIndexRegressionMs = Number(next);
         break;
       default:
         throw new Error(`Unknown argument: ${arg}`);
@@ -94,6 +144,115 @@ function avg(values) {
     return 0;
   }
   return values.reduce((acc, cur) => acc + cur, 0) / values.length;
+}
+
+function readBaselineMetric(raw, getter, label) {
+  const value = getter(raw);
+  if (!Number.isFinite(value)) {
+    throw new Error(`Baseline missing numeric ${label}`);
+  }
+  return value;
+}
+
+function loadBaseline(baselinePath) {
+  if (!baselinePath) {
+    return {
+      loaded: false,
+      path: null,
+      message: "No baseline path provided; skipping delta checks.",
+      baseline: null,
+    };
+  }
+
+  const resolvedPath = path.resolve(baselinePath);
+  try {
+    const raw = JSON.parse(fs.readFileSync(resolvedPath, "utf8"));
+    const baseline = {
+      completionP95Ms: readBaselineMetric(raw, (v) => v && v.completion && v.completion.p95Ms, "completion.p95Ms"),
+      hoverP95Ms: readBaselineMetric(raw, (v) => v && v.hover && v.hover.p95Ms, "hover.p95Ms"),
+      indexDurationMs: readBaselineMetric(raw, (v) => v && v.index && v.index.durationMs, "index.durationMs"),
+    };
+    return {
+      loaded: true,
+      path: resolvedPath,
+      message: `Loaded baseline from ${resolvedPath}.`,
+      baseline,
+    };
+  } catch (error) {
+    return {
+      loaded: false,
+      path: resolvedPath,
+      message: `Unable to load baseline from ${resolvedPath}: ${error.message}`,
+      baseline: null,
+    };
+  }
+}
+
+function computeDelta(metrics, baselineState, args) {
+  const delta = {
+    baselinePath: baselineState.path,
+    baselineLoaded: baselineState.loaded,
+    message: baselineState.message,
+    completionP95Ms: null,
+    hoverP95Ms: null,
+    indexDurationMs: null,
+    thresholds: {
+      maxCompletionP95RegressionMs: args.maxCompletionP95RegressionMs,
+      maxHoverP95RegressionMs: args.maxHoverP95RegressionMs,
+      maxIndexRegressionMs: args.maxIndexRegressionMs,
+    },
+  };
+
+  if (!baselineState.loaded || !baselineState.baseline) {
+    return delta;
+  }
+
+  delta.completionP95Ms = Number(
+    (metrics.completion.p95Ms - baselineState.baseline.completionP95Ms).toFixed(3)
+  );
+  delta.hoverP95Ms = Number((metrics.hover.p95Ms - baselineState.baseline.hoverP95Ms).toFixed(3));
+  delta.indexDurationMs = Number(
+    (metrics.index.durationMs - baselineState.baseline.indexDurationMs).toFixed(3)
+  );
+  return delta;
+}
+
+function collectFailures(metrics, args, delta) {
+  const failures = [];
+  if (metrics.completion.p95Ms > args.maxCompletionP95Ms) {
+    failures.push(
+      `completion p95 ${metrics.completion.p95Ms}ms > ${args.maxCompletionP95Ms}ms`
+    );
+  }
+  if (metrics.hover.p95Ms > args.maxHoverP95Ms) {
+    failures.push(`hover p95 ${metrics.hover.p95Ms}ms > ${args.maxHoverP95Ms}ms`);
+  }
+  if (args.maxIndexMs > 0 && metrics.index.durationMs > args.maxIndexMs) {
+    failures.push(`index duration ${metrics.index.durationMs}ms > ${args.maxIndexMs}ms`);
+  }
+
+  if (delta.baselineLoaded) {
+    if (
+      Number.isFinite(delta.completionP95Ms)
+      && delta.completionP95Ms > args.maxCompletionP95RegressionMs
+    ) {
+      failures.push(
+        `completion p95 regression ${delta.completionP95Ms}ms > ${args.maxCompletionP95RegressionMs}ms`
+      );
+    }
+    if (Number.isFinite(delta.hoverP95Ms) && delta.hoverP95Ms > args.maxHoverP95RegressionMs) {
+      failures.push(
+        `hover p95 regression ${delta.hoverP95Ms}ms > ${args.maxHoverP95RegressionMs}ms`
+      );
+    }
+    if (Number.isFinite(delta.indexDurationMs) && delta.indexDurationMs > args.maxIndexRegressionMs) {
+      failures.push(
+        `index duration regression ${delta.indexDurationMs}ms > ${args.maxIndexRegressionMs}ms`
+      );
+    }
+  }
+
+  return failures;
 }
 
 async function getProcessRssBytes(pid) {
@@ -254,6 +413,10 @@ class LspClient {
 
 async function run() {
   const args = parseArgs(process.argv);
+  if (args.help) {
+    printHelp();
+    return;
+  }
   const repoRoot = path.resolve(__dirname, "..");
 
   const binaryName = process.platform === "win32" ? "vscode-ls-php-server.exe" : "vscode-ls-php-server";
@@ -408,20 +571,23 @@ async function run() {
       maxCompletionP95Ms: args.maxCompletionP95Ms,
       maxHoverP95Ms: args.maxHoverP95Ms,
       maxIndexMs: args.maxIndexMs > 0 ? args.maxIndexMs : null,
+      maxCompletionP95RegressionMs: args.maxCompletionP95RegressionMs,
+      maxHoverP95RegressionMs: args.maxHoverP95RegressionMs,
+      maxIndexRegressionMs: args.maxIndexRegressionMs,
     },
   };
 
-  const failures = [];
-  if (metrics.completion.p95Ms > args.maxCompletionP95Ms) {
-    failures.push(
-      `completion p95 ${metrics.completion.p95Ms}ms > ${args.maxCompletionP95Ms}ms`
-    );
+  const baselineState = loadBaseline(args.baseline);
+  if (!baselineState.loaded && args.baseline) {
+    process.stderr.write(`${baselineState.message}\n`);
   }
-  if (metrics.hover.p95Ms > args.maxHoverP95Ms) {
-    failures.push(`hover p95 ${metrics.hover.p95Ms}ms > ${args.maxHoverP95Ms}ms`);
-  }
-  if (args.maxIndexMs > 0 && metrics.index.durationMs > args.maxIndexMs) {
-    failures.push(`index duration ${metrics.index.durationMs}ms > ${args.maxIndexMs}ms`);
+
+  metrics.delta = computeDelta(metrics, baselineState, args);
+
+  const failures = collectFailures(metrics, args, metrics.delta);
+  let baselineRequirementFailure = null;
+  if (args.requireBaseline && !baselineState.loaded) {
+    baselineRequirementFailure = `baseline is required but could not be loaded (${baselineState.path || "no path"})`;
   }
 
   const outputJson = `${JSON.stringify(metrics, null, 2)}\n`;
@@ -439,9 +605,22 @@ async function run() {
     process.stderr.write(`Performance gate failed: ${failures.join("; ")}\n`);
     process.exit(2);
   }
+  if (baselineRequirementFailure) {
+    process.stderr.write(`Performance gate failed: ${baselineRequirementFailure}\n`);
+    process.exit(2);
+  }
 }
 
-run().catch((error) => {
-  process.stderr.write(`${error.stack || error.message}\n`);
-  process.exit(1);
-});
+if (require.main === module) {
+  run().catch((error) => {
+    process.stderr.write(`${error.stack || error.message}\n`);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  parseArgs,
+  loadBaseline,
+  computeDelta,
+  collectFailures,
+};
